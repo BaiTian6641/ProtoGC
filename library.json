@@ -5,7 +5,7 @@
   "keywords": "memory, gc, garbage-collector, esp32, esp32s3, psram, heap, arena, pool, allocator, fragmentation, dma, freertos",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ProtoTracer/ProtoGC.git"
+    "url": "https://github.com/BaiTian6641/ProtoGC.git"
   },
   "authors": [
     {
