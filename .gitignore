@@ -1,0 +1,11 @@
+# ProtoGC library .gitignore
+.pio/
+.vscode/
+*.o
+*.a
+*.so
+*.dylib
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc

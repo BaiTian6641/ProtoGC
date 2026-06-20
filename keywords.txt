@@ -1,0 +1,119 @@
+#######################################
+# ProtoGC Keywords — syntax highlighting
+#######################################
+
+ProtoGC	KEYWORD1
+HeapGuard	KEYWORD1
+ArenaAllocator	KEYWORD1
+PoolAllocator	KEYWORD1
+HeapAllocator	KEYWORD1
+ScopedArena	KEYWORD1
+ProtoJsonPsramAllocator	KEYWORD1
+ProtoJsonInternalAllocator	KEYWORD1
+
+ArenaPolicy	KEYWORD1
+CollectPhase	KEYWORD1
+DeferredFreeKind	KEYWORD1
+HeapStats	KEYWORD1
+ArenaRecord	KEYWORD1
+PurgeRecord	KEYWORD1
+DeferredFreeRecord	KEYWORD1
+
+begin	KEYWORD2
+end	KEYWORD2
+alloc	KEYWORD2
+allocate	KEYWORD2
+deallocate	KEYWORD2
+reallocate	KEYWORD2
+free	KEYWORD2
+reset	KEYWORD2
+owns	KEYWORD2
+trim	KEYWORD2
+capacity	KEYWORD2
+used	KEYWORD2
+peakUsed	KEYWORD2
+remaining	KEYWORD2
+allocCount	KEYWORD2
+isReady	KEYWORD2
+isFull	KEYWORD2
+blockSize	KEYWORD2
+totalBlocks	KEYWORD2
+usedBlocks	KEYWORD2
+freeBlocks	KEYWORD2
+peakBlocks	KEYWORD2
+reservedBytes	KEYWORD2
+usedBytes	KEYWORD2
+stats	KEYWORD2
+
+collectLight	KEYWORD2
+collectFull	KEYWORD2
+emergency	KEYWORD2
+poll	KEYWORD2
+heapAlloc	KEYWORD2
+heapCalloc	KEYWORD2
+heapRealloc	KEYWORD2
+heapFree	KEYWORD2
+poolAlloc	KEYWORD2
+poolFree	KEYWORD2
+poolOwns	KEYWORD2
+psramAlloc	KEYWORD2
+psramCalloc	KEYWORD2
+psramRealloc	KEYWORD2
+internalAlloc	KEYWORD2
+internalCalloc	KEYWORD2
+internalRealloc	KEYWORD2
+mallocTrim	KEYWORD2
+drainDeferredFrees	KEYWORD2
+
+registerArena	KEYWORD2
+unregisterArena	KEYWORD2
+createArena	KEYWORD2
+destroyArena	KEYWORD2
+scratchArena	KEYWORD2
+registerPurgeCallback	KEYWORD2
+unregisterPurgeCallback	KEYWORD2
+lockMallocToPsram	KEYWORD2
+isMallocLockedToPsram	KEYWORD2
+enableNewDeleteTakeover	KEYWORD2
+isNewDeleteTakeoverEnabled	KEYWORD2
+deferHeapFree	KEYWORD2
+deferPoolFree	KEYWORD2
+
+check	KEYWORD2
+onWarning	KEYWORD2
+onCritical	KEYWORD2
+print	KEYWORD2
+
+ensureCapacity	KEYWORD2
+resetIfEmpty	KEYWORD2
+trimIfEmpty	KEYWORD2
+usableSize	KEYWORD2
+segmentCount	KEYWORD2
+
+malloc	KEYWORD2
+calloc	KEYWORD2
+realloc	KEYWORD2
+
+#######################################
+# Constants (LITERAL1)
+#######################################
+
+PROTOGC_POOL_32	LITERAL1
+PROTOGC_POOL_64	LITERAL1
+PROTOGC_POOL_128	LITERAL1
+PROTOGC_POOL_256	LITERAL1
+PROTOGC_POOL_512	LITERAL1
+PROTOGC_POOL_1K	LITERAL1
+PROTOGC_MAX_ARENAS	LITERAL1
+PROTOGC_MAX_PURGE_CALLBACKS	LITERAL1
+PROTOGC_DEFERRED_FREE_SLOTS	LITERAL1
+PROTOGC_SCRATCH_ARENA_BYTES	LITERAL1
+PROTOGC_WARN_LARGEST_BLOCK	LITERAL1
+PROTOGC_CRITICAL_LARGEST_BLOCK	LITERAL1
+PROTOGC_HEAP_SEGMENT_BYTES	LITERAL1
+PROTOGC_PSRAM_HEAP_SEGMENT_BYTES	LITERAL1
+PROTOGC_INTERNAL_HEAP_SEGMENT_BYTES	LITERAL1
+
+CollectLightPhase	LITERAL1
+CollectFullPhase	LITERAL1
+CollectEmergencyPhase	LITERAL1

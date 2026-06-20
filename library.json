@@ -1,0 +1,29 @@
+{
+  "name": "ProtoGC",
+  "version": "1.0.0",
+  "description": "Cooperative garbage collector for ESP32-S3 FreeRTOS — two-level heap strategy (internal DRAM for DMA, PSRAM for application) with pool allocators, arena allocators, segmented coalescing heaps, and heap health monitoring. Designed to eliminate internal DRAM fragmentation in long-running embedded rendering workloads.",
+  "keywords": "memory, gc, garbage-collector, esp32, esp32s3, psram, heap, arena, pool, allocator, fragmentation, dma, freertos",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ProtoTracer/ProtoGC.git"
+  },
+  "authors": [
+    {
+      "name": "ProtoTracer",
+      "maintainer": true
+    }
+  ],
+  "license": "AGPL-3.0",
+  "frameworks": ["arduino", "espidf"],
+  "platforms": ["espressif32"],
+  "headers": [
+    "ProtoGC.h",
+    "ArenaAllocator.h",
+    "HeapAllocator.h",
+    "PoolAllocator.h"
+  ],
+  "build": {
+    "srcFilter": ["+<*>", "-<.git/>", "-<.svn/>"],
+    "libCompatMode": "strict"
+  }
+}
