@@ -114,6 +114,7 @@ public:
         newSize = alignUp(newSize);
         BlockHeader* block = findBlockByPayload(ptr);
         if (!block) return ReallocStatus::NotOwned;
+        if (block->free) return ReallocStatus::NotOwned;  // freed concurrently during the unlocked growth window
 
         if (block->size >= newSize) {
             shrinkBlock(block, newSize);
