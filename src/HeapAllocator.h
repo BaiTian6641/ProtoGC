@@ -165,6 +165,8 @@ public:
     //   trimUnlink(): call WITH the lock; then releaseSegments() WITHOUT the
     //       lock; finally addTrimReleased() WITH the lock.
 
+    struct SegmentHeader;
+
     struct BlockHeader {
         uint32_t magic;
         size_t size;

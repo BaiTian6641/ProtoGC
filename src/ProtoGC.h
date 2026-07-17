@@ -191,7 +191,7 @@ struct HeapStats {
 
     void print(const char* tag = "ProtoGC") const {
         std::printf("[%s] intFree=%u intLargest=%u psramFree=%u psramLargest=%u "
-                    "arena=%u/%u peak=%u pool=%u/%u pkblk=%u psramManaged=%u/%u largest=%u seg=%u ",
+                    "arena=%u/%u peak=%u pool=%u/%u pkblk=%u psramManaged=%u/%u largest=%u seg=%u "
                     "intManaged=%u/%u largest=%u seg=%u fallback=%u peak=%u blocks=%u "
                     "deferred=%u hi=%u ovf=%u reclaimed=%u trim=%u/%u "
                     "gc=%u/%u/%u lock=%u\n",
