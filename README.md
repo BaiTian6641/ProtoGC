@@ -94,6 +94,14 @@ Allocations requesting `MALLOC_CAP_SPIRAM` go to the PSRAM managed heap. Allocat
 - `trim()` scans for fully-free segments and releases them back to the ESP-IDF heap
 - **Pointers never move** — compatible with all C++ code
 
+> **API note (v1.1):** `HeapAllocator`'s direct interface changed to support
+> two-phase locking (slow `heap_caps_*` calls now run outside ProtoGC's
+> critical section): `allocate()` is **non-growing**, `reallocate()` returns
+> `ReallocStatus` + out-param, and `trim()` was replaced by
+> `trimUnlink()/releaseSegments()/addTrimReleased()`. The `ProtoGC::` facade
+> (`heapAlloc`/`heapRealloc`/`mallocTrim`/…) is unchanged — only standalone
+> `HeapAllocator` users are affected.
+
 ```
 Segment 0:  [HDR|████████ allocated ████████|HDR|░░░░ free ░░░░░░░|HDR|█████ alloc █████]
 Segment 1:  [HDR|░░░░░░░░░░ entirely free ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  ← trim() releases
