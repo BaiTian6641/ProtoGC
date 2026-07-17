@@ -140,6 +140,22 @@ public:
         return released;
     }
 
+    /// Two-phase trim helper (M-01): if the pool is completely unused, detach
+    /// the backing buffer WITHOUT freeing it and return it to the caller, who
+    /// then heap_caps_free()s it OUTSIDE the ProtoGC critical section.
+    /// Returns nullptr when the pool is in use or not initialized.
+    /// The pool stays valid (a later begin() re-creates the backing buffer).
+    uint8_t* detachIfEmpty(size_t* outBytes = nullptr) {
+        if (mAllocCount != 0 || !mBuffer) return nullptr;
+        if (outBytes) *outBytes = BlockSize * BlockCount;
+        uint8_t* buf = mBuffer;
+        mBuffer   = nullptr;
+        mFreeList = nullptr;
+        mPeakCount = 0;
+        clearBitmap();
+        return buf;
+    }
+
     // Number of blocks currently allocated
     size_t usedBlocks()  const { return mAllocCount; }
     size_t freeBlocks()  const { return BlockCount - mAllocCount; }

@@ -3,8 +3,10 @@
 //
 // This allocator owns one or more ESP-IDF heap_caps_malloc() segments. Each
 // segment is internally split into blocks, freed blocks are coalesced, and
-// trim() returns fully-free segments to the system heap. It does not move live
-// allocations, so all returned pointers remain stable until freed.
+// trimUnlink()/releaseSegments() return fully-free segments to the system heap
+// (two-phase, so heap_caps_free runs outside the caller's critical section).
+// It does not move live allocations, so all returned pointers remain stable
+// until freed.
 
 #include <cstddef>
 #include <cstdint>
@@ -59,18 +61,19 @@ public:
         mForbiddenCaps = forbiddenCaps;
     }
 
+    // Non-growing allocation: searches existing segments only.
+    // Thread-safety contract: callers must serialize access (ProtoGC holds its
+    // own critical section around all calls). To grow the heap, the caller
+    // creates a segment WITHOUT the lock (createSegment), then links and
+    // retries WITH the lock (linkSegment + allocate). This keeps slow
+    // heap_caps_malloc calls out of ProtoGC's critical section (M-01).
     void* allocate(size_t sizeBytes, uint32_t caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) {
         if (!isEligibleCaps(caps)) return nullptr;
         if (sizeBytes == 0) sizeBytes = 1;
         sizeBytes = alignUp(sizeBytes);
 
         BlockHeader* block = findFreeBlock(sizeBytes, caps);
-        if (!block) {
-            SegmentHeader* segment = createSegment(sizeBytes, caps);
-            if (!segment) return nullptr;
-            linkSegment(segment);
-            block = segment->first;
-        }
+        if (!block) return nullptr;
 
         splitBlock(block, sizeBytes);
         block->free = false;
@@ -79,33 +82,52 @@ public:
         else mFreeBytes = 0;
         ++mAllocationCount;
         if (mUsedBytes > mPeakUsedBytes) mPeakUsedBytes = mUsedBytes;
+        mSearchHint = block->segment;  // M-02: next search starts here
         return payload(block);
     }
 
-    void* reallocate(void* ptr,
-                     size_t newSize,
-                     uint32_t caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) {
-        if (!ptr) return allocate(newSize, caps);
+    enum class ReallocStatus : uint8_t { Done, NotOwned, NeedsGrowth };
+
+    // Attempt a reallocation without growing the heap. Call with the ProtoGC
+    // lock held. On NeedsGrowth the caller should createSegment() (unlocked),
+    // linkSegment() (locked), and retry — growth paths then succeed.
+    ReallocStatus reallocate(void* ptr,
+                             size_t newSize,
+                             uint32_t caps,
+                             void** outPtr) {
+        if (!outPtr) return ReallocStatus::NotOwned;
+        *outPtr = nullptr;
+
+        if (!ptr) {
+            void* fresh = allocate(newSize, caps);
+            if (fresh) {
+                *outPtr = fresh;
+                return ReallocStatus::Done;
+            }
+            return ReallocStatus::NeedsGrowth;
+        }
         if (newSize == 0) {
             deallocate(ptr);
-            return nullptr;
+            return ReallocStatus::Done;
         }
 
         newSize = alignUp(newSize);
         BlockHeader* block = findBlockByPayload(ptr);
-        if (!block) return nullptr;
+        if (!block) return ReallocStatus::NotOwned;
 
         if (block->size >= newSize) {
             shrinkBlock(block, newSize);
-            return ptr;
+            *outPtr = ptr;
+            return ReallocStatus::Done;
         }
 
         const size_t oldSize = block->size;
         void* replacement = allocate(newSize, caps);
-        if (!replacement) return nullptr;
+        if (!replacement) return ReallocStatus::NeedsGrowth;
         std::memcpy(replacement, ptr, oldSize < newSize ? oldSize : newSize);
         deallocate(ptr);
-        return replacement;
+        *outPtr = replacement;
+        return ReallocStatus::Done;
     }
 
     bool deallocate(void* ptr) {
@@ -133,28 +155,115 @@ public:
         return block ? block->size : 0;
     }
 
-    size_t trim(size_t padBytes = 0) {
-        size_t released = 0;
+    // ─── Two-Phase Growth & Trim API ────────────────────────────────────────
+    // Internal — used by ProtoGC to keep heap_caps_malloc/free calls OUT of
+    // its critical section (M-01). Contract:
+    //   allocate/deallocate/reallocate/owns/usableSize/stats: call WITH the
+    //       ProtoGC lock held.
+    //   createSegment(): call WITHOUT the lock (may block in heap_caps_malloc).
+    //   linkSegment(): call WITH the lock.
+    //   trimUnlink(): call WITH the lock; then releaseSegments() WITHOUT the
+    //       lock; finally addTrimReleased() WITH the lock.
+
+    struct BlockHeader {
+        uint32_t magic;
+        size_t size;
+        bool free;
+        SegmentHeader* segment;
+        BlockHeader* prev;
+        BlockHeader* next;
+    };
+
+    struct SegmentHeader {
+        uint32_t magic;
+        size_t totalBytes;
+        uint32_t caps;
+        SegmentHeader* prev;
+        SegmentHeader* next;
+        BlockHeader* first;
+    };
+
+    SegmentHeader* createSegment(size_t requestedPayloadBytes, uint32_t caps) {
+        size_t payloadBytes = alignUp(requestedPayloadBytes > mDefaultSegmentBytes
+                                          ? requestedPayloadBytes
+                                          : mDefaultSegmentBytes);
+        size_t totalBytes = segmentHeaderBytes() + blockHeaderBytes() + payloadBytes;
+        void* raw = heap_caps_malloc(totalBytes, caps);
+        if (!raw && payloadBytes > requestedPayloadBytes) {
+            payloadBytes = alignUp(requestedPayloadBytes);
+            totalBytes = segmentHeaderBytes() + blockHeaderBytes() + payloadBytes;
+            raw = heap_caps_malloc(totalBytes, caps);
+        }
+        if (!raw) return nullptr;
+
+        SegmentHeader* segment = static_cast<SegmentHeader*>(raw);
+        segment->magic = kSegmentMagic;
+        segment->totalBytes = totalBytes;
+        segment->caps = caps;
+        segment->prev = nullptr;
+        segment->next = nullptr;
+
+        BlockHeader* block = reinterpret_cast<BlockHeader*>(
+            reinterpret_cast<uint8_t*>(segment) + segmentHeaderBytes());
+        block->magic = kBlockMagic;
+        block->size = payloadBytes;
+        block->free = true;
+        block->segment = segment;
+        block->prev = nullptr;
+        block->next = nullptr;
+        segment->first = block;
+        return segment;
+    }
+
+    void linkSegment(SegmentHeader* segment) {
+        segment->next = mHead;
+        if (mHead) mHead->prev = segment;
+        mHead = segment;
+        ++mSegmentCount;
+        mSegmentBytes += segment->totalBytes;
+        mFreeBytes += segment->first ? segment->first->size : 0;
+    }
+
+    /// Phase 1 (lock held): detach up to `maxSegments` fully-free segments into
+    /// `outSegments`. Returns the count written. Call releaseSegments() next.
+    size_t trimUnlink(size_t padBytes, SegmentHeader** outSegments, size_t maxSegments) {
+        if (!outSegments || maxSegments == 0) return 0;
+        size_t count = 0;
         size_t releasableFree = freeBytes();
         SegmentHeader* segment = mHead;
 
-        while (segment) {
+        while (segment && count < maxSegments) {
             SegmentHeader* next = segment->next;
             if (segmentIsCompletelyFree(segment) && releasableFree > padBytes) {
                 const size_t payloadBytes = segment->first ? segment->first->size : 0;
                 if (releasableFree >= payloadBytes && releasableFree - payloadBytes >= padBytes) {
                     unlinkSegment(segment);
-                    released += segment->totalBytes;
+                    outSegments[count++] = segment;
                     releasableFree -= payloadBytes;
-                    heap_caps_free(segment);
                 }
             }
             segment = next;
         }
+        return count;
+    }
 
-        mTrimReleasedBytes += released;
+    /// Phase 2 (lock NOT held): return detached segments to the system heap.
+    /// Static — touches no allocator state, safe to call unlocked.
+    /// Returns total bytes released. Entries are nulled after release.
+    static size_t releaseSegments(SegmentHeader** segments, size_t count) {
+        size_t released = 0;
+        if (!segments) return 0;
+        for (size_t i = 0; i < count; ++i) {
+            if (!segments[i]) continue;
+            released += segments[i]->totalBytes;
+            heap_caps_free(segments[i]);
+            segments[i] = nullptr;
+        }
         return released;
     }
+
+    /// Phase 3 (lock held): account for released bytes in the stats.
+    void addTrimReleased(size_t bytes) { mTrimReleasedBytes += bytes; }
 
     Stats stats() const {
         Stats result;
@@ -200,31 +309,12 @@ public:
         }
 
 private:
-    struct SegmentHeader;
-
-    struct BlockHeader {
-        uint32_t magic;
-        size_t size;
-        bool free;
-        SegmentHeader* segment;
-        BlockHeader* prev;
-        BlockHeader* next;
-    };
-
-    struct SegmentHeader {
-        uint32_t magic;
-        size_t totalBytes;
-        uint32_t caps;
-        SegmentHeader* prev;
-        SegmentHeader* next;
-        BlockHeader* first;
-    };
-
     static constexpr uint32_t kSegmentMagic = 0x50475347UL;
     static constexpr uint32_t kBlockMagic = 0x5047424CUL;
     static constexpr size_t kAlignment = sizeof(void*) < 8 ? 8 : sizeof(void*);
 
     SegmentHeader* mHead = nullptr;
+    SegmentHeader* mSearchHint = nullptr;  // M-02 roving segment cursor
     size_t mDefaultSegmentBytes = PROTOGC_HEAP_SEGMENT_BYTES;
     size_t mSegmentCount = 0;
     size_t mSegmentBytes = 0;
@@ -264,47 +354,6 @@ private:
         return reinterpret_cast<const uint8_t*>(block) + blockHeaderBytes();
     }
 
-    SegmentHeader* createSegment(size_t requestedPayloadBytes, uint32_t caps) {
-        size_t payloadBytes = alignUp(requestedPayloadBytes > mDefaultSegmentBytes
-                                          ? requestedPayloadBytes
-                                          : mDefaultSegmentBytes);
-        size_t totalBytes = segmentHeaderBytes() + blockHeaderBytes() + payloadBytes;
-        void* raw = heap_caps_malloc(totalBytes, caps);
-        if (!raw && payloadBytes > requestedPayloadBytes) {
-            payloadBytes = alignUp(requestedPayloadBytes);
-            totalBytes = segmentHeaderBytes() + blockHeaderBytes() + payloadBytes;
-            raw = heap_caps_malloc(totalBytes, caps);
-        }
-        if (!raw) return nullptr;
-
-        SegmentHeader* segment = static_cast<SegmentHeader*>(raw);
-        segment->magic = kSegmentMagic;
-        segment->totalBytes = totalBytes;
-        segment->caps = caps;
-        segment->prev = nullptr;
-        segment->next = nullptr;
-
-        BlockHeader* block = reinterpret_cast<BlockHeader*>(
-            reinterpret_cast<uint8_t*>(segment) + segmentHeaderBytes());
-        block->magic = kBlockMagic;
-        block->size = payloadBytes;
-        block->free = true;
-        block->segment = segment;
-        block->prev = nullptr;
-        block->next = nullptr;
-        segment->first = block;
-        return segment;
-    }
-
-    void linkSegment(SegmentHeader* segment) {
-        segment->next = mHead;
-        if (mHead) mHead->prev = segment;
-        mHead = segment;
-        ++mSegmentCount;
-        mSegmentBytes += segment->totalBytes;
-        mFreeBytes += segment->first ? segment->first->size : 0;
-    }
-
     void unlinkSegment(SegmentHeader* segment) {
         if (segment->prev) segment->prev->next = segment->next;
         else mHead = segment->next;
@@ -312,24 +361,40 @@ private:
         if (mSegmentCount > 0) --mSegmentCount;
         if (mSegmentBytes >= segment->totalBytes) mSegmentBytes -= segment->totalBytes;
         if (segment->first && mFreeBytes >= segment->first->size) mFreeBytes -= segment->first->size;
+        if (mSearchHint == segment) {
+            // Hint must never dangle (M-02): move to the next segment, else head.
+            mSearchHint = segment->next ? segment->next : mHead;
+        }
     }
 
     BlockHeader* findFreeBlock(size_t sizeBytes, uint32_t caps) const {
-        SegmentHeader* segment = mHead;
+        // M-02: roving segment cursor (mSearchHint) avoids always-from-head
+        // segment scans; within each segment the search stays best-fit.
+        // Exact-fit blocks short-circuit immediately.
+        SegmentHeader* start = mSearchHint ? mSearchHint : mHead;
+        SegmentHeader* segment = start;
+        bool wrapped = false;
         while (segment) {
             if (segmentSatisfiesCaps(segment, caps)) {
                 BlockHeader* block = segment->first;
                 BlockHeader* best = nullptr;
                 while (block) {
-                    if (block->free && block->size >= sizeBytes &&
-                        (!best || block->size < best->size)) {
-                        best = block;
+                    if (block->free && block->size >= sizeBytes) {
+                        if (block->size == sizeBytes) return block;  // exact fit
+                        if (!best || block->size < best->size) {
+                            best = block;
+                        }
                     }
                     block = block->next;
                 }
                 if (best) return best;
             }
             segment = segment->next;
+            if (!segment && !wrapped) {
+                segment = mHead;
+                wrapped = true;
+            }
+            if (segment == start) break;
         }
         return nullptr;
     }

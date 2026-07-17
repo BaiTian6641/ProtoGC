@@ -58,6 +58,12 @@
 #ifndef PROTOGC_POLL_DRAIN_LIMIT
 #define PROTOGC_POLL_DRAIN_LIMIT 4
 #endif
+#ifndef PROTOGC_HEAPGUARD_POLL_DIVIDER
+// HeapGuard is checked every Nth ProtoGC::poll() call (1 = every call, the
+// pre-optimization behavior; 0 also means every call). Checks are always
+// performed inside collectFull()/emergency() regardless of this divider.
+#define PROTOGC_HEAPGUARD_POLL_DIVIDER 64
+#endif
 #ifndef PROTOGC_SCRATCH_ARENA_BYTES
 #define PROTOGC_SCRATCH_ARENA_BYTES 65536
 #endif
@@ -152,6 +158,7 @@ struct HeapStats {
     size_t poolReservedBytes = 0;
     size_t poolUsedBytes = 0;
     size_t poolUsedBlocks = 0;
+    size_t poolPeakBlocks = 0;
     size_t fallbackBytes = 0;
     size_t fallbackPeakBytes = 0;
     size_t fallbackBlocks = 0;
@@ -174,6 +181,8 @@ struct HeapStats {
     size_t psramTrimReleasedBytes = 0;
     size_t internalTrimReleasedBytes = 0;
     size_t deferredFreeCount = 0;
+    size_t deferredHighWater = 0;
+    size_t deferredOverflowCount = 0;
     size_t lastReclaimedBytes = 0;
     uint32_t lightCollections = 0;
     uint32_t fullCollections = 0;
@@ -182,9 +191,9 @@ struct HeapStats {
 
     void print(const char* tag = "ProtoGC") const {
         std::printf("[%s] intFree=%u intLargest=%u psramFree=%u psramLargest=%u "
-                    "arena=%u/%u peak=%u pool=%u/%u psramManaged=%u/%u largest=%u seg=%u "
+                    "arena=%u/%u peak=%u pool=%u/%u pkblk=%u psramManaged=%u/%u largest=%u seg=%u ",
                     "intManaged=%u/%u largest=%u seg=%u fallback=%u peak=%u blocks=%u "
-                    "deferred=%u reclaimed=%u trim=%u/%u "
+                    "deferred=%u hi=%u ovf=%u reclaimed=%u trim=%u/%u "
                     "gc=%u/%u/%u lock=%u\n",
                     tag,
                     static_cast<unsigned>(internalFree),
@@ -196,6 +205,7 @@ struct HeapStats {
                     static_cast<unsigned>(arenaPeak),
                     static_cast<unsigned>(poolUsedBytes),
                     static_cast<unsigned>(poolReservedBytes),
+                    static_cast<unsigned>(poolPeakBlocks),
                     static_cast<unsigned>(psramManagedUsedBytes),
                     static_cast<unsigned>(psramManagedSegmentBytes),
                     static_cast<unsigned>(psramManagedLargestFreeBlock),
@@ -208,6 +218,8 @@ struct HeapStats {
                     static_cast<unsigned>(fallbackPeakBytes),
                     static_cast<unsigned>(fallbackBlocks),
                     static_cast<unsigned>(deferredFreeCount),
+                    static_cast<unsigned>(deferredHighWater),
+                    static_cast<unsigned>(deferredOverflowCount),
                     static_cast<unsigned>(lastReclaimedBytes),
                     static_cast<unsigned>(psramTrimReleasedBytes),
                     static_cast<unsigned>(internalTrimReleasedBytes),
@@ -357,11 +369,32 @@ public:
         if (isInIsrContext()) return nullptr;
         if (sizeBytes == 0) sizeBytes = 1;
 
+        // Fast path: allocate from existing segments under the lock (M-01:
+        // the lock now covers only ProtoGC-owned metadata, never raw
+        // heap_caps_malloc calls).
         portENTER_CRITICAL(&sMux);
         HeapAllocator* managedHeap = managedHeapForCapsLocked(caps);
         void* managed = managedHeap ? managedHeap->allocate(sizeBytes, caps) : nullptr;
         portEXIT_CRITICAL(&sMux);
         if (managed) return managed;
+
+        // Slow path: grow the managed heap. The raw segment allocation runs
+        // WITHOUT sMux held (heap_caps_malloc takes its own internal locks and
+        // may block); only linking + the final allocate run under the lock.
+        if (managedHeap) {
+            HeapAllocator::SegmentHeader* segment =
+                managedHeap->createSegment(sizeBytes, caps);
+            if (segment) {
+                portENTER_CRITICAL(&sMux);
+                managedHeap->linkSegment(segment);
+                managed = managedHeap->allocate(sizeBytes, caps);
+                portEXIT_CRITICAL(&sMux);
+                if (managed) return managed;
+                // Concurrent allocations consumed the new segment's room;
+                // leave it linked (it will serve future allocations) and fall
+                // through to the fallback path.
+            }
+        }
 
         AllocationHeader* header = static_cast<AllocationHeader*>(
             heap_caps_malloc(sizeof(AllocationHeader) + sizeBytes, caps));
@@ -409,14 +442,35 @@ public:
             return nullptr;
         }
 
+        // Managed-heap path (M-01): attempt under the lock; if a new segment
+        // is needed, create it unlocked, then link + retry under the lock.
         portENTER_CRITICAL(&sMux);
         HeapAllocator* managedHeap = owningManagedHeapLocked(ptr);
-        void* managed = managedHeap ? managedHeap->reallocate(ptr, newSize, managedHeap->requiredCaps()) : nullptr;
+        void* managed = nullptr;
+        HeapAllocator::ReallocStatus status = managedHeap
+            ? managedHeap->reallocate(ptr, newSize, managedHeap->requiredCaps(), &managed)
+            : HeapAllocator::ReallocStatus::NotOwned;
         portEXIT_CRITICAL(&sMux);
-        if (managed) return managed;
 
-        if (managedHeap) return nullptr;
+        if (status == HeapAllocator::ReallocStatus::Done) return managed;
 
+        if (status == HeapAllocator::ReallocStatus::NeedsGrowth) {
+            HeapAllocator::SegmentHeader* segment =
+                managedHeap->createSegment(newSize, managedHeap->requiredCaps());
+            if (segment) {
+                portENTER_CRITICAL(&sMux);
+                managedHeap->linkSegment(segment);
+                status = managedHeap->reallocate(ptr, newSize,
+                                                 managedHeap->requiredCaps(), &managed);
+                portEXIT_CRITICAL(&sMux);
+                if (status == HeapAllocator::ReallocStatus::Done) return managed;
+            }
+            // Growth failed — the pointer is owned by the managed heap and we
+            // must not fall through to the fallback path (matches old behavior).
+            return nullptr;
+        }
+
+        // NotOwned → fallback-list path (unmanaged raw allocation).
         size_t oldSize = 0;
         uint32_t oldCaps = caps;
         bool fallbackOwned = false;
@@ -574,17 +628,58 @@ public:
         if (isInIsrContext()) return 0;
 
         size_t reclaimed = drainDeferredFrees(0);
-        portENTER_CRITICAL(&sMux);
-        reclaimed += sPsramHeap.trim(padBytes);
-        reclaimed += sInternalHeap.trim(padBytes);
-        if (trimEmptyPools) {
-            reclaimed += sPool32.trimIfEmpty();
-            reclaimed += sPool64.trimIfEmpty();
-            reclaimed += sPool128.trimIfEmpty();
-            reclaimed += sPool256.trimIfEmpty();
-            reclaimed += sPool512.trimIfEmpty();
-            reclaimed += sPool1K.trimIfEmpty();
+
+        // M-01 two-phase trim: detach fully-free heap segments (and empty pool
+        // buffers) under the lock, then return them to the system heap WITHOUT
+        // holding sMux — heap_caps_free takes its own internal locks and may
+        // block. Loops because unlinking is batched (kTrimBatch per pass).
+        constexpr size_t kTrimBatch = 8;
+        HeapAllocator::SegmentHeader* segs[kTrimBatch];
+        uint8_t* poolBufs[6];
+
+        size_t releasedTotal = 0;
+        while (true) {
+            size_t nPsram = 0, nInternal = 0, nPools = 0;
+            size_t releasedPools = 0;
+
+            portENTER_CRITICAL(&sMux);
+            nPsram    = sPsramHeap.trimUnlink(padBytes, segs, kTrimBatch);
+            nInternal = sInternalHeap.trimUnlink(padBytes, segs + nPsram, kTrimBatch - nPsram);
+            if (trimEmptyPools && nPsram + nInternal == 0) {
+                size_t poolBytes = 0;
+                uint8_t* b;
+                if ((b = sPool32.detachIfEmpty(&poolBytes)))  { poolBufs[nPools++] = b; releasedPools += poolBytes; poolBytes = 0; }
+                if ((b = sPool64.detachIfEmpty(&poolBytes)))  { poolBufs[nPools++] = b; releasedPools += poolBytes; poolBytes = 0; }
+                if ((b = sPool128.detachIfEmpty(&poolBytes))) { poolBufs[nPools++] = b; releasedPools += poolBytes; poolBytes = 0; }
+                if ((b = sPool256.detachIfEmpty(&poolBytes))) { poolBufs[nPools++] = b; releasedPools += poolBytes; poolBytes = 0; }
+                if ((b = sPool512.detachIfEmpty(&poolBytes))) { poolBufs[nPools++] = b; releasedPools += poolBytes; poolBytes = 0; }
+                if ((b = sPool1K.detachIfEmpty(&poolBytes)))  { poolBufs[nPools++] = b; releasedPools += poolBytes; }
+            }
+            portEXIT_CRITICAL(&sMux);
+
+            if (nPsram + nInternal == 0 && nPools == 0) break;
+
+            const size_t relPsram    = HeapAllocator::releaseSegments(segs, nPsram);
+            const size_t relInternal = HeapAllocator::releaseSegments(segs + nPsram, nInternal);
+            for (size_t i = 0; i < nPools; ++i) {
+                if (poolBufs[i]) heap_caps_free(poolBufs[i]);
+            }
+
+            portENTER_CRITICAL(&sMux);
+            sPsramHeap.addTrimReleased(relPsram);
+            sInternalHeap.addTrimReleased(relInternal);
+            portEXIT_CRITICAL(&sMux);
+
+            releasedTotal += relPsram + relInternal + releasedPools;
+
+            // Pool detach runs at most once (pools either empty or not).
+            if (nPsram + nInternal == 0) break;
         }
+
+        // Account for everything freed above (heap segments + pool buffers).
+        reclaimed += releasedTotal;
+
+        portENTER_CRITICAL(&sMux);
         sLastReclaimedBytes = reclaimed;
         portEXIT_CRITICAL(&sMux);
         return reclaimed;
@@ -615,6 +710,10 @@ public:
         reclaimed += drainDeferredFrees(0);
         reclaimed += mallocTrim(0, false);
 
+        // Guaranteed heap-health check on every full collection, independent
+        // of the rate-limited poll() cadence (PROTOGC_HEAPGUARD_POLL_DIVIDER).
+        HeapGuard::poll();
+
         portENTER_CRITICAL(&sMux);
         sFullCollections++;
         sLastReclaimedBytes = reclaimed;
@@ -632,6 +731,9 @@ public:
         reclaimed += drainDeferredFrees(0);
         reclaimed += mallocTrim(0, true);
 
+        // Guaranteed heap-health check on every emergency collection.
+        HeapGuard::poll();
+
         portENTER_CRITICAL(&sMux);
         sEmergencyCollections++;
         sLastReclaimedBytes = reclaimed;
@@ -642,6 +744,13 @@ public:
 
     static void poll() {
         drainDeferredFrees(PROTOGC_POLL_DRAIN_LIMIT);
+#if PROTOGC_HEAPGUARD_POLL_DIVIDER > 1
+        // Rate-limited HeapGuard: full check only every Nth poll to keep the
+        // per-frame cost of heap_caps_get_* queries off the hot loop.
+        // collectFull()/emergency() always check regardless (see there).
+        if (++sHeapGuardPollCounter < PROTOGC_HEAPGUARD_POLL_DIVIDER) return;
+        sHeapGuardPollCounter = 0;
+#endif
         HeapGuard::poll();
     }
 
@@ -659,6 +768,7 @@ public:
         result.poolReservedBytes = poolReservedBytesLocked();
         result.poolUsedBytes = poolUsedBytesLocked();
         result.poolUsedBlocks = poolUsedBlocksLocked();
+        result.poolPeakBlocks = poolPeakBlocksLocked();
         const HeapAllocator::Stats psramStats = sPsramHeap.stats();
         const HeapAllocator::Stats internalStats = sInternalHeap.stats();
         result.psramManagedSegmentBytes = psramStats.segmentBytes;
@@ -685,6 +795,8 @@ public:
         result.fallbackPeakBytes = sFallbackPeakBytes;
         result.fallbackBlocks = sFallbackBlocks;
         result.deferredFreeCount = sDeferredCount;
+        result.deferredHighWater = sDeferredHighWater;
+        result.deferredOverflowCount = sDeferredOverflowCount;
         result.lastReclaimedBytes = sLastReclaimedBytes;
         result.lightCollections = sLightCollections;
         result.fullCollections = sFullCollections;
@@ -723,6 +835,7 @@ private:
     static uint32_t sLightCollections;
     static uint32_t sFullCollections;
     static uint32_t sEmergencyCollections;
+    static uint32_t sHeapGuardPollCounter;
     static portMUX_TYPE sMux;
 
     static ArenaRecord sArenaRecords[PROTOGC_MAX_ARENAS];
@@ -731,6 +844,8 @@ private:
     static size_t sDeferredHead;
     static size_t sDeferredTail;
     static size_t sDeferredCount;
+    static size_t sDeferredHighWater;
+    static size_t sDeferredOverflowCount;
 
     static ArenaAllocator sScratchArena;
     static HeapAllocator sPsramHeap;
@@ -859,6 +974,9 @@ private:
         if (fromIsr) portENTER_CRITICAL_ISR(&sMux);
         else portENTER_CRITICAL(&sMux);
         if (sDeferredCount >= PROTOGC_DEFERRED_FREE_SLOTS) {
+            // Ring full — the free is dropped (memory leaks). Now observable
+            // via stats().deferredOverflowCount instead of failing silently.
+            ++sDeferredOverflowCount;
             if (fromIsr) portEXIT_CRITICAL_ISR(&sMux);
             else portEXIT_CRITICAL(&sMux);
             return false;
@@ -867,6 +985,7 @@ private:
         sDeferredFrees[sDeferredHead].kind = kind;
         sDeferredHead = (sDeferredHead + 1) % PROTOGC_DEFERRED_FREE_SLOTS;
         ++sDeferredCount;
+        if (sDeferredCount > sDeferredHighWater) sDeferredHighWater = sDeferredCount;
         if (fromIsr) portEXIT_CRITICAL_ISR(&sMux);
         else portEXIT_CRITICAL(&sMux);
         return true;
@@ -970,6 +1089,11 @@ private:
                sPool256.usedBlocks() + sPool512.usedBlocks() + sPool1K.usedBlocks();
     }
 
+    static size_t poolPeakBlocksLocked() {
+        return sPool32.peakBlocks() + sPool64.peakBlocks() + sPool128.peakBlocks() +
+               sPool256.peakBlocks() + sPool512.peakBlocks() + sPool1K.peakBlocks();
+    }
+
     static void printCollection(const char* tag,
                                 const char* phaseName,
                                 const HeapStats& before,
@@ -1065,6 +1189,7 @@ inline size_t ProtoGC::sLastReclaimedBytes = 0;
 inline uint32_t ProtoGC::sLightCollections = 0;
 inline uint32_t ProtoGC::sFullCollections = 0;
 inline uint32_t ProtoGC::sEmergencyCollections = 0;
+inline uint32_t ProtoGC::sHeapGuardPollCounter = 0;
 inline portMUX_TYPE ProtoGC::sMux = portMUX_INITIALIZER_UNLOCKED;
 
 inline ArenaRecord ProtoGC::sArenaRecords[PROTOGC_MAX_ARENAS] = {};
@@ -1073,6 +1198,8 @@ inline DeferredFreeRecord ProtoGC::sDeferredFrees[PROTOGC_DEFERRED_FREE_SLOTS] =
 inline size_t ProtoGC::sDeferredHead = 0;
 inline size_t ProtoGC::sDeferredTail = 0;
 inline size_t ProtoGC::sDeferredCount = 0;
+inline size_t ProtoGC::sDeferredHighWater = 0;
+inline size_t ProtoGC::sDeferredOverflowCount = 0;
 
 inline ArenaAllocator ProtoGC::sScratchArena;
 inline HeapAllocator ProtoGC::sPsramHeap;

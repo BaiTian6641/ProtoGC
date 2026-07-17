@@ -211,10 +211,16 @@ HeapGuard::onCritical([](HeapGuard::Level level, size_t freeBytes, size_t larges
 
 // Poll in your main loop
 void loop() {
-    ProtoGC::poll();  // drains deferred frees + checks HeapGuard thresholds
+    ProtoGC::poll();  // drains deferred frees; HeapGuard checked every Nth call
     // ... application logic ...
 }
 ```
+
+**HeapGuard check cadence:** `poll()` drains deferred frees on every call, but the
+HeapGuard level check (which queries `heap_caps_get_*`) is rate-limited to every
+`PROTOGC_HEAPGUARD_POLL_DIVIDER`-th call (default **64**) to keep per-frame cost off
+the hot loop. Set the divider to `1` for the legacy every-call behavior. Checks are
+**always** performed inside `collectFull()` and `emergency()` regardless of the divider.
 
 Thresholds (configurable via `#define`):
 
@@ -240,7 +246,9 @@ ProtoGC::poll();                       // drains up to PROTOGC_POLL_DRAIN_LIMIT 
 ProtoGC::drainDeferredFrees(0);        // drains ALL deferred frees
 ```
 
-The ring buffer holds up to `PROTOGC_DEFERRED_FREE_SLOTS` (default 32) entries. If the buffer overflows, the free is silently dropped (the memory leaks — tune the slot count if this happens).
+The ring buffer holds up to `PROTOGC_DEFERRED_FREE_SLOTS` (default 32) entries. If the buffer overflows, the free is dropped (the memory leaks) — this is now **observable**: `stats().deferredOverflowCount` increments per dropped free and `stats().deferredHighWater` records the peak ring depth. Watch `hi`/`ovf` in `stats().print()` output; if `ovf` ever moves, raise the slot count or drain more often.
+
+**Drain-rate guidance (M-05):** `poll()` drains up to `PROTOGC_POLL_DRAIN_LIMIT` (4) per call; `collectLight()`/`collectFull()`/`emergency()` always drain **all** pending frees. If ISR producers outpace 4/frame, call `collectLight("frame")` every frame instead of relying on `poll()` alone.
 
 ---
 
@@ -418,9 +426,9 @@ Callback signature: `void callback(uint8_t phaseMask, void* context)`
 
 ```
 [ProtoGC] intFree=287456 intLargest=262144 psramFree=4194304 psramLargest=1048576
-arena=0/65536 peak=32768 pool=0/36864 psramManaged=8192/65536 largest=57344 seg=1
+arena=0/65536 peak=32768 pool=0/36864 pkblk=0 psramManaged=8192/65536 largest=57344 seg=1
 intManaged=0/8192 largest=8192 seg=1 fallback=0 peak=4096 blocks=0
-deferred=0 reclaimed=32768 trim=0/0 gc=5/2/0 lock=1
+deferred=0 hi=0 ovf=0 reclaimed=32768 trim=0/0 gc=5/2/0 lock=1
 ```
 
 ### Operator New
@@ -452,10 +460,36 @@ All tunables are `#define` macros — set them **before** `#include <ProtoGC.h>`
 | `PROTOGC_MAX_PURGE_CALLBACKS` | 8 | Max registered purge callbacks |
 | `PROTOGC_DEFERRED_FREE_SLOTS` | 32 | Deferred free ring buffer size |
 | `PROTOGC_POLL_DRAIN_LIMIT` | 4 | Max deferred frees drained per `poll()` |
+| `PROTOGC_HEAPGUARD_POLL_DIVIDER` | 64 | HeapGuard checked every Nth `poll()` (1 = every call) |
 | `PROTOGC_WARN_LARGEST_BLOCK` | 32768 | Warn when largest internal free block < 32 KB |
 | `PROTOGC_CRITICAL_LARGEST_BLOCK` | 8192 | Critical when largest internal free block < 8 KB |
 | `PROTOGC_PRINT_COLLECTIONS` | 1 | Print collection stats to stdout |
 | `PROTOGC_OVERRIDE_NEW` | 1 | Enable global `operator new` takeover at init |
+
+---
+
+## Pool Sizing Guide
+
+The six pools cover fixed block sizes 32 B–1 KB. Defaults are conservative for
+general use; tune them per workload with the `PROTOGC_POOL_*` macros (build flags
+or before `#include <ProtoGC.h>`).
+
+**How to measure:** `ProtoGC::stats()` reports `poolUsedBlocks` (current),
+`poolPeakBlocks` (high-water — this is the number to size against), and
+`poolReservedBytes`. Sample after a representative workload (e.g., one UI scene,
+one render loop burst) via `stats().print("tune")`.
+
+| Workload | Churn profile | Suggested tuning |
+|---|---|---|
+| LVGL UI (styles, strings, small structs) | mostly 48–160 B | raise `PROTOGC_POOL_64` and `PROTOGC_POOL_128` (e.g., 128/96) |
+| JSON parsing / theme loading | 128–512 B temp | raise `PROTOGC_POOL_256`/`_512`; or use a ResetOnLight arena instead |
+| Rendering drivers (fixed cmd structs) | one size dominates | size that pool to 2× peak; shrink others |
+| BLE/network stacks | 32–64 B descriptors | raise `PROTOGC_POOL_32`/`_64` |
+
+Rules of thumb:
+- A block bigger than 1 KB skips the pools entirely → managed heap (fine for rare large allocs).
+- Keep total pool reservation within your PSRAM budget — each block costs its full size, always resident (until `trimIfEmpty`/`detachIfEmpty` during emergency collection).
+- If `poolPeakBlocks` stays under ~50 % of a pool's blocks, that pool is oversized — return PSRAM to the heap.
 
 ---
 
