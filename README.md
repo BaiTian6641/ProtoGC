@@ -4,7 +4,7 @@
 
 Designed to eliminate internal DRAM fragmentation in long-running embedded rendering workloads (HUB75 LED panels, camera pipelines, BLE stacks).
 
-[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Platform: ESP32](https://img.shields.io/badge/Platform-ESP32--S3-green.svg)]()
 [![Framework: Arduino / ESP-IDF](https://img.shields.io/badge/Framework-Arduino%20%7C%20ESP--IDF-red.svg)]()
 
@@ -461,9 +461,7 @@ All tunables are `#define` macros — set them **before** `#include <ProtoGC.h>`
 
 ## License
 
-**GNU Affero General Public License v3.0** — see [LICENSE](LICENSE) for the full text.
-
-If you use ProtoGC in a networked service (including an ESP32-S3 serving HTTP/WebSocket/MQTT), the AGPL requires that you make the source code available to users interacting with that service.
+**MIT License** — see [LICENSE](LICENSE) for the full text.
 
 ---
 

@@ -13,7 +13,7 @@
       "maintainer": true
     }
   ],
-  "license": "AGPL-3.0",
+  "license": "MIT",
   "frameworks": ["arduino", "espidf"],
   "platforms": ["espressif32"],
   "headers": [
