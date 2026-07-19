@@ -14,7 +14,8 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <esp_heap_caps.h>
+
+#include "pgc_platform.h"
 
 namespace protogc {
 
@@ -36,14 +37,14 @@ public:
     }
 
     ~ArenaAllocator() {
-        if (mBuffer) heap_caps_free(mBuffer);
+        if (mBuffer) pgc_free(mBuffer);
     }
 
     // Allocate backing buffer from PSRAM. Returns false on failure.
     bool begin(size_t capacityBytes) {
-        if (mBuffer) heap_caps_free(mBuffer);
+        if (mBuffer) pgc_free(mBuffer);
         mBuffer = static_cast<uint8_t*>(
-            heap_caps_malloc(capacityBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+            pgc_malloc(capacityBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
         if (!mBuffer) {
             mCapacity = 0;
             return false;
@@ -96,7 +97,7 @@ public:
     // Release backing buffer entirely.
     size_t end() {
         const size_t released = mBuffer ? mCapacity : 0;
-        if (mBuffer) { heap_caps_free(mBuffer); mBuffer = nullptr; }
+        if (mBuffer) { pgc_free(mBuffer); mBuffer = nullptr; }
         mCapacity   = 0;
         mOffset     = 0;
         mPeakOffset = 0;

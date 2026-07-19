@@ -17,9 +17,7 @@
 #include <cstring>
 #include <new>
 
-#include <esp_heap_caps.h>
-#include <freertos/FreeRTOS.h>
-#include <freertos/portmacro.h>
+#include "pgc_platform.h"
 
 #ifndef PROTOGC_POOL_32
 #define PROTOGC_POOL_32 64
@@ -118,8 +116,8 @@ public:
     using Callback = void (*)(Level level, size_t freeBytes, size_t largestBlock);
 
     static Level check(size_t* outFree = nullptr, size_t* outLargest = nullptr) {
-        const size_t freeBytes = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-        const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        const size_t freeBytes = pgc_free_size(MALLOC_CAP_INTERNAL);
+        const size_t largest = pgc_largest_free_block(MALLOC_CAP_INTERNAL);
         if (outFree) *outFree = freeBytes;
         if (outLargest) *outLargest = largest;
 
@@ -235,6 +233,7 @@ public:
     using PurgeCallback = void (*)(uint8_t phaseMask, void* context);
 
     static bool begin(size_t scratchArenaBytes = PROTOGC_SCRATCH_ARENA_BYTES) {
+        pgc_init();  // one-time backend init (no-op on ESP-IDF) — before any allocation
         if (sBeginCalled) return sInitialized;
         sBeginCalled = true;
         sPsramHeap.begin(PROTOGC_PSRAM_HEAP_SEGMENT_BYTES,
@@ -263,34 +262,30 @@ public:
 #if PROTOGC_OVERRIDE_NEW
         // Default policy: route global operator new through ProtoGC so PSRAM is
         // preferred for every C++ allocation, with internal SRAM as fallback.
-        // Direct heap_caps_malloc DMA/EXEC paths are unaffected (those bypass new).
+        // Direct pgc_malloc DMA/EXEC paths are unaffected (those bypass new).
         sNewDeleteTakeoverEnabled = sInitialized;
 #endif
         return sInitialized;
     }
 
     static void lockMallocToPsram(size_t mallocExternalThreshold = 0) {
-        heap_caps_malloc_extmem_enable(mallocExternalThreshold);
-        portENTER_CRITICAL(&sMux);
+        pgc_set_external_alloc_threshold(mallocExternalThreshold);
+        pgc_enter_critical();
         sMallocLockedToPsram = true;
         sMallocExternalThreshold = mallocExternalThreshold;
-        portEXIT_CRITICAL(&sMux);
+        pgc_exit_critical();
     }
 
     static bool isMallocLockedToPsram() { return sMallocLockedToPsram; }
 
     static bool isInIsrContext() {
-#if defined(ESP32)
-        return xPortInIsrContext();
-#else
-        return false;
-#endif
+        return pgc_in_isr();
     }
 
     static void enableNewDeleteTakeover(bool enabled = true) {
-        portENTER_CRITICAL(&sMux);
+        pgc_enter_critical();
         sNewDeleteTakeoverEnabled = enabled;
-        portEXIT_CRITICAL(&sMux);
+        pgc_exit_critical();
     }
 
     static bool isNewDeleteTakeoverEnabled() { return sNewDeleteTakeoverEnabled; }
@@ -336,13 +331,13 @@ public:
                               bool ownsObject = false) {
         if (!arena) return false;
 
-        portENTER_CRITICAL(&sMux);
+        pgc_enter_critical();
         for (size_t i = 0; i < PROTOGC_MAX_ARENAS; ++i) {
             if (sArenaRecords[i].arena == arena) {
                 sArenaRecords[i].policy = policy;
                 sArenaRecords[i].name = name;
                 sArenaRecords[i].ownsObject = ownsObject;
-                portEXIT_CRITICAL(&sMux);
+                pgc_exit_critical();
                 return true;
             }
         }
@@ -352,11 +347,11 @@ public:
                 sArenaRecords[i].policy = policy;
                 sArenaRecords[i].name = name;
                 sArenaRecords[i].ownsObject = ownsObject;
-                portEXIT_CRITICAL(&sMux);
+                pgc_exit_critical();
                 return true;
             }
         }
-        portEXIT_CRITICAL(&sMux);
+        pgc_exit_critical();
         return false;
     }
 
@@ -371,24 +366,24 @@ public:
 
         // Fast path: allocate from existing segments under the lock (M-01:
         // the lock now covers only ProtoGC-owned metadata, never raw
-        // heap_caps_malloc calls).
-        portENTER_CRITICAL(&sMux);
+        // pgc_malloc calls).
+        pgc_enter_critical();
         HeapAllocator* managedHeap = managedHeapForCapsLocked(caps);
         void* managed = managedHeap ? managedHeap->allocate(sizeBytes, caps) : nullptr;
-        portEXIT_CRITICAL(&sMux);
+        pgc_exit_critical();
         if (managed) return managed;
 
         // Slow path: grow the managed heap. The raw segment allocation runs
-        // WITHOUT sMux held (heap_caps_malloc takes its own internal locks and
+        // WITHOUT the lock held (pgc_malloc takes its own internal locks and
         // may block); only linking + the final allocate run under the lock.
         if (managedHeap) {
             HeapAllocator::SegmentHeader* segment =
                 managedHeap->createSegment(sizeBytes, caps);
             if (segment) {
-                portENTER_CRITICAL(&sMux);
+                pgc_enter_critical();
                 managedHeap->linkSegment(segment);
                 managed = managedHeap->allocate(sizeBytes, caps);
-                portEXIT_CRITICAL(&sMux);
+                pgc_exit_critical();
                 if (managed) return managed;
                 // Concurrent allocations consumed the new segment's room;
                 // leave it linked (it will serve future allocations) and fall
@@ -397,7 +392,7 @@ public:
         }
 
         AllocationHeader* header = static_cast<AllocationHeader*>(
-            heap_caps_malloc(sizeof(AllocationHeader) + sizeBytes, caps));
+            pgc_malloc(sizeof(AllocationHeader) + sizeBytes, caps));
         if (!header) return nullptr;
 
         header->magic = kAllocationMagic;
@@ -405,14 +400,14 @@ public:
         header->caps = caps;
         header->prev = nullptr;
 
-        portENTER_CRITICAL(&sMux);
+        pgc_enter_critical();
         header->next = sFallbackHead;
         if (sFallbackHead) sFallbackHead->prev = header;
         sFallbackHead = header;
         sFallbackBlocks++;
         sFallbackBytes += sizeBytes;
         if (sFallbackBytes > sFallbackPeakBytes) sFallbackPeakBytes = sFallbackBytes;
-        portEXIT_CRITICAL(&sMux);
+        pgc_exit_critical();
 
         return static_cast<void*>(header + 1);
     }
@@ -444,13 +439,13 @@ public:
 
         // Managed-heap path (M-01): attempt under the lock; if a new segment
         // is needed, create it unlocked, then link + retry under the lock.
-        portENTER_CRITICAL(&sMux);
+        pgc_enter_critical();
         HeapAllocator* managedHeap = owningManagedHeapLocked(ptr);
         void* managed = nullptr;
         HeapAllocator::ReallocStatus status = managedHeap
             ? managedHeap->reallocate(ptr, newSize, managedHeap->requiredCaps(), &managed)
             : HeapAllocator::ReallocStatus::NotOwned;
-        portEXIT_CRITICAL(&sMux);
+        pgc_exit_critical();
 
         if (status == HeapAllocator::ReallocStatus::Done) return managed;
 
@@ -458,11 +453,11 @@ public:
             HeapAllocator::SegmentHeader* segment =
                 managedHeap->createSegment(newSize, managedHeap->requiredCaps());
             if (segment) {
-                portENTER_CRITICAL(&sMux);
+                pgc_enter_critical();
                 managedHeap->linkSegment(segment);
                 status = managedHeap->reallocate(ptr, newSize,
                                                  managedHeap->requiredCaps(), &managed);
-                portEXIT_CRITICAL(&sMux);
+                pgc_exit_critical();
                 if (status == HeapAllocator::ReallocStatus::Done) return managed;
             }
             // Growth failed — the pointer is owned by the managed heap and we
@@ -474,14 +469,14 @@ public:
         size_t oldSize = 0;
         uint32_t oldCaps = caps;
         bool fallbackOwned = false;
-        portENTER_CRITICAL(&sMux);
+        pgc_enter_critical();
         AllocationHeader* header = findFallbackHeaderLocked(ptr);
         if (header) {
             oldSize = header->size;
             oldCaps = header->caps;
             fallbackOwned = true;
         }
-        portEXIT_CRITICAL(&sMux);
+        pgc_exit_critical();
         if (!fallbackOwned) return nullptr;
 
         void* replacement = heapAlloc(newSize, oldCaps);
@@ -523,9 +518,9 @@ public:
     static void* poolAlloc(size_t sizeBytes) {
         if (isInIsrContext()) return nullptr;
         void* ptr = nullptr;
-        portENTER_CRITICAL(&sMux);
+        pgc_enter_critical();
         ptr = poolAllocInternalLocked(sizeBytes);
-        portEXIT_CRITICAL(&sMux);
+        pgc_exit_critical();
         if (ptr) return ptr;
         return heapAlloc(sizeBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
@@ -538,9 +533,9 @@ public:
         }
 
         bool freedByPool = false;
-        portENTER_CRITICAL(&sMux);
+        pgc_enter_critical();
         freedByPool = poolFreeInternalLocked(ptr);
-        portEXIT_CRITICAL(&sMux);
+        pgc_exit_critical();
 
         if (freedByPool) return;
         heapFree(ptr);
@@ -548,10 +543,10 @@ public:
 
     static bool poolOwns(void* ptr) {
         bool owned = false;
-        portENTER_CRITICAL(&sMux);
+        pgc_enter_critical();
         owned = sPool32.owns(ptr) || sPool64.owns(ptr) || sPool128.owns(ptr) ||
                 sPool256.owns(ptr) || sPool512.owns(ptr) || sPool1K.owns(ptr);
-        portEXIT_CRITICAL(&sMux);
+        pgc_exit_critical();
         return owned;
     }
 
@@ -585,12 +580,12 @@ public:
                                       uint8_t phases = CollectFullPhase | CollectEmergencyPhase) {
         if (!callback || phases == 0) return false;
 
-        portENTER_CRITICAL(&sMux);
+        pgc_enter_critical();
         for (size_t i = 0; i < PROTOGC_MAX_PURGE_CALLBACKS; ++i) {
             if (sPurgeRecords[i].callback == callback && sPurgeRecords[i].context == context) {
                 sPurgeRecords[i].name = name;
                 sPurgeRecords[i].phases = phases;
-                portEXIT_CRITICAL(&sMux);
+                pgc_exit_critical();
                 return true;
             }
         }
@@ -600,27 +595,27 @@ public:
                 sPurgeRecords[i].callback = callback;
                 sPurgeRecords[i].context = context;
                 sPurgeRecords[i].phases = phases;
-                portEXIT_CRITICAL(&sMux);
+                pgc_exit_critical();
                 return true;
             }
         }
         sPurgeRegistryOverflow = true;
-        portEXIT_CRITICAL(&sMux);
+        pgc_exit_critical();
         return false;
     }
 
     static bool unregisterPurgeCallback(PurgeCallback callback, void* context = nullptr) {
         if (!callback) return false;
 
-        portENTER_CRITICAL(&sMux);
+        pgc_enter_critical();
         for (size_t i = 0; i < PROTOGC_MAX_PURGE_CALLBACKS; ++i) {
             if (sPurgeRecords[i].callback == callback && sPurgeRecords[i].context == context) {
                 sPurgeRecords[i] = PurgeRecord();
-                portEXIT_CRITICAL(&sMux);
+                pgc_exit_critical();
                 return true;
             }
         }
-        portEXIT_CRITICAL(&sMux);
+        pgc_exit_critical();
         return false;
     }
 
@@ -631,7 +626,7 @@ public:
 
         // M-01 two-phase trim: detach fully-free heap segments (and empty pool
         // buffers) under the lock, then return them to the system heap WITHOUT
-        // holding sMux — heap_caps_free takes its own internal locks and may
+        // holding the lock — pgc_free takes its own internal locks and may
         // block. Loops because unlinking is batched (kTrimBatch per pass).
         constexpr size_t kTrimBatch = 8;
         HeapAllocator::SegmentHeader* segs[kTrimBatch];
@@ -642,7 +637,7 @@ public:
             size_t nPsram = 0, nInternal = 0, nPools = 0;
             size_t releasedPools = 0;
 
-            portENTER_CRITICAL(&sMux);
+            pgc_enter_critical();
             nPsram    = sPsramHeap.trimUnlink(padBytes, segs, kTrimBatch);
             nInternal = sInternalHeap.trimUnlink(padBytes, segs + nPsram, kTrimBatch - nPsram);
             if (trimEmptyPools && nPsram + nInternal == 0) {
@@ -655,20 +650,20 @@ public:
                 if ((b = sPool512.detachIfEmpty(&poolBytes))) { poolBufs[nPools++] = b; releasedPools += poolBytes; poolBytes = 0; }
                 if ((b = sPool1K.detachIfEmpty(&poolBytes)))  { poolBufs[nPools++] = b; releasedPools += poolBytes; }
             }
-            portEXIT_CRITICAL(&sMux);
+            pgc_exit_critical();
 
             if (nPsram + nInternal == 0 && nPools == 0) break;
 
             const size_t relPsram    = HeapAllocator::releaseSegments(segs, nPsram);
             const size_t relInternal = HeapAllocator::releaseSegments(segs + nPsram, nInternal);
             for (size_t i = 0; i < nPools; ++i) {
-                if (poolBufs[i]) heap_caps_free(poolBufs[i]);
+                if (poolBufs[i]) pgc_free(poolBufs[i]);
             }
 
-            portENTER_CRITICAL(&sMux);
+            pgc_enter_critical();
             sPsramHeap.addTrimReleased(relPsram);
             sInternalHeap.addTrimReleased(relInternal);
-            portEXIT_CRITICAL(&sMux);
+            pgc_exit_critical();
 
             releasedTotal += relPsram + relInternal + releasedPools;
 
@@ -679,9 +674,9 @@ public:
         // Account for everything freed above (heap segments + pool buffers).
         reclaimed += releasedTotal;
 
-        portENTER_CRITICAL(&sMux);
+        pgc_enter_critical();
         sLastReclaimedBytes = reclaimed;
-        portEXIT_CRITICAL(&sMux);
+        pgc_exit_critical();
         return reclaimed;
     }
 
@@ -693,10 +688,10 @@ public:
         runPurgeCallbacks(CollectLightPhase);
         reclaimed += drainDeferredFrees(0);
 
-        portENTER_CRITICAL(&sMux);
+        pgc_enter_critical();
         sLightCollections++;
         sLastReclaimedBytes = reclaimed;
-        portEXIT_CRITICAL(&sMux);
+        pgc_exit_critical();
 
         printCollection(tag, "light", before, stats(), reclaimed);
     }
@@ -714,10 +709,10 @@ public:
         // of the rate-limited poll() cadence (PROTOGC_HEAPGUARD_POLL_DIVIDER).
         HeapGuard::poll();
 
-        portENTER_CRITICAL(&sMux);
+        pgc_enter_critical();
         sFullCollections++;
         sLastReclaimedBytes = reclaimed;
-        portEXIT_CRITICAL(&sMux);
+        pgc_exit_critical();
 
         printCollection(tag, "full", before, stats(), reclaimed);
     }
@@ -734,10 +729,10 @@ public:
         // Guaranteed heap-health check on every emergency collection.
         HeapGuard::poll();
 
-        portENTER_CRITICAL(&sMux);
+        pgc_enter_critical();
         sEmergencyCollections++;
         sLastReclaimedBytes = reclaimed;
-        portEXIT_CRITICAL(&sMux);
+        pgc_exit_critical();
 
         printCollection(tag, "emergency", before, stats(), reclaimed);
     }
@@ -746,7 +741,8 @@ public:
         drainDeferredFrees(PROTOGC_POLL_DRAIN_LIMIT);
 #if PROTOGC_HEAPGUARD_POLL_DIVIDER > 1
         // Rate-limited HeapGuard: full check only every Nth poll to keep the
-        // per-frame cost of heap_caps_get_* queries off the hot loop.
+        // per-frame cost of pgc_free_size/pgc_largest_free_block queries off
+        // the hot loop.
         // collectFull()/emergency() always check regardless (see there).
         if (++sHeapGuardPollCounter < PROTOGC_HEAPGUARD_POLL_DIVIDER) return;
         sHeapGuardPollCounter = 0;
@@ -756,12 +752,12 @@ public:
 
     static HeapStats stats() {
         HeapStats result;
-        result.internalFree = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-        result.internalLargestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-        result.psramFree = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-        result.psramLargestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+        result.internalFree = pgc_free_size(MALLOC_CAP_INTERNAL);
+        result.internalLargestBlock = pgc_largest_free_block(MALLOC_CAP_INTERNAL);
+        result.psramFree = pgc_free_size(MALLOC_CAP_SPIRAM);
+        result.psramLargestBlock = pgc_largest_free_block(MALLOC_CAP_SPIRAM);
 
-        portENTER_CRITICAL(&sMux);
+        pgc_enter_critical();
         result.arenaCapacity = arenaCapacityLocked();
         result.arenaUsed = arenaUsedLocked();
         result.arenaPeak = arenaPeakLocked();
@@ -802,7 +798,7 @@ public:
         result.fullCollections = sFullCollections;
         result.emergencyCollections = sEmergencyCollections;
         result.mallocLockedToPsram = sMallocLockedToPsram;
-        portEXIT_CRITICAL(&sMux);
+        pgc_exit_critical();
         return result;
     }
 
@@ -836,7 +832,6 @@ private:
     static uint32_t sFullCollections;
     static uint32_t sEmergencyCollections;
     static uint32_t sHeapGuardPollCounter;
-    static portMUX_TYPE sMux;
 
     static ArenaRecord sArenaRecords[PROTOGC_MAX_ARENAS];
     static PurgeRecord sPurgeRecords[PROTOGC_MAX_PURGE_CALLBACKS];
@@ -879,16 +874,16 @@ private:
         if (outOwnsObject) *outOwnsObject = false;
         if (!arena) return false;
 
-        portENTER_CRITICAL(&sMux);
+        pgc_enter_critical();
         for (size_t i = 0; i < PROTOGC_MAX_ARENAS; ++i) {
             if (sArenaRecords[i].arena == arena) {
                 if (outOwnsObject) *outOwnsObject = sArenaRecords[i].ownsObject;
                 sArenaRecords[i] = ArenaRecord();
-                portEXIT_CRITICAL(&sMux);
+                pgc_exit_critical();
                 return true;
             }
         }
-        portEXIT_CRITICAL(&sMux);
+        pgc_exit_critical();
         return false;
     }
 
@@ -913,14 +908,14 @@ private:
     }
 
     static void compactEmptyPools() {
-        portENTER_CRITICAL(&sMux);
+        pgc_enter_critical();
         sPool32.resetIfEmpty();
         sPool64.resetIfEmpty();
         sPool128.resetIfEmpty();
         sPool256.resetIfEmpty();
         sPool512.resetIfEmpty();
         sPool1K.resetIfEmpty();
-        portEXIT_CRITICAL(&sMux);
+        pgc_exit_critical();
     }
 
     static AllocationHeader* findFallbackHeaderLocked(void* ptr) {
@@ -934,19 +929,19 @@ private:
     static size_t heapFreeBytes(void* ptr) {
         if (!ptr) return 0;
 
-        portENTER_CRITICAL(&sMux);
+        pgc_enter_critical();
         HeapAllocator* managedHeap = owningManagedHeapLocked(ptr);
         const size_t managedSize = managedHeap ? managedHeap->usableSize(ptr) : 0;
         if (managedHeap && managedHeap->deallocate(ptr)) {
-            portEXIT_CRITICAL(&sMux);
+            pgc_exit_critical();
             return managedSize;
         }
-        portEXIT_CRITICAL(&sMux);
+        pgc_exit_critical();
 
-        portENTER_CRITICAL(&sMux);
+        pgc_enter_critical();
         AllocationHeader* header = findFallbackHeaderLocked(ptr);
         if (!header) {
-            portEXIT_CRITICAL(&sMux);
+            pgc_exit_critical();
             return 0;
         }
 
@@ -957,13 +952,13 @@ private:
         if (sFallbackBytes >= size) sFallbackBytes -= size;
         else sFallbackBytes = 0;
         if (sFallbackBlocks > 0) --sFallbackBlocks;
-        portEXIT_CRITICAL(&sMux);
+        pgc_exit_critical();
 
         header->magic = kAllocationFreed;
         header->prev = nullptr;
         header->next = nullptr;
 
-        heap_caps_free(header);
+        pgc_free(header);
         return size;
     }
 
@@ -971,14 +966,14 @@ private:
         if (!ptr) return true;
 
         const bool fromIsr = isInIsrContext();
-        if (fromIsr) portENTER_CRITICAL_ISR(&sMux);
-        else portENTER_CRITICAL(&sMux);
+        if (fromIsr) pgc_enter_critical_isr();
+        else pgc_enter_critical();
         if (sDeferredCount >= PROTOGC_DEFERRED_FREE_SLOTS) {
             // Ring full — the free is dropped (memory leaks). Now observable
             // via stats().deferredOverflowCount instead of failing silently.
             ++sDeferredOverflowCount;
-            if (fromIsr) portEXIT_CRITICAL_ISR(&sMux);
-            else portEXIT_CRITICAL(&sMux);
+            if (fromIsr) pgc_exit_critical_isr();
+            else pgc_exit_critical();
             return false;
         }
         sDeferredFrees[sDeferredHead].ptr = ptr;
@@ -986,24 +981,24 @@ private:
         sDeferredHead = (sDeferredHead + 1) % PROTOGC_DEFERRED_FREE_SLOTS;
         ++sDeferredCount;
         if (sDeferredCount > sDeferredHighWater) sDeferredHighWater = sDeferredCount;
-        if (fromIsr) portEXIT_CRITICAL_ISR(&sMux);
-        else portEXIT_CRITICAL(&sMux);
+        if (fromIsr) pgc_exit_critical_isr();
+        else pgc_exit_critical();
         return true;
     }
 
     static bool popDeferredFree(DeferredFreeRecord* out) {
         if (!out) return false;
 
-        portENTER_CRITICAL(&sMux);
+        pgc_enter_critical();
         if (sDeferredCount == 0) {
-            portEXIT_CRITICAL(&sMux);
+            pgc_exit_critical();
             return false;
         }
         *out = sDeferredFrees[sDeferredTail];
         sDeferredFrees[sDeferredTail] = DeferredFreeRecord();
         sDeferredTail = (sDeferredTail + 1) % PROTOGC_DEFERRED_FREE_SLOTS;
         --sDeferredCount;
-        portEXIT_CRITICAL(&sMux);
+        pgc_exit_critical();
         return true;
     }
 
@@ -1011,7 +1006,7 @@ private:
         ArenaAllocator* arenas[PROTOGC_MAX_ARENAS];
         size_t count = 0;
 
-        portENTER_CRITICAL(&sMux);
+        pgc_enter_critical();
         for (size_t i = 0; i < PROTOGC_MAX_ARENAS; ++i) {
             ArenaAllocator* arena = sArenaRecords[i].arena;
             if (!arena) continue;
@@ -1024,7 +1019,7 @@ private:
                 arenas[count++] = arena;
             }
         }
-        portEXIT_CRITICAL(&sMux);
+        pgc_exit_critical();
 
         size_t reclaimed = 0;
         for (size_t i = 0; i < count; ++i) {
@@ -1037,13 +1032,13 @@ private:
         PurgeRecord callbacks[PROTOGC_MAX_PURGE_CALLBACKS];
         size_t count = 0;
 
-        portENTER_CRITICAL(&sMux);
+        pgc_enter_critical();
         for (size_t i = 0; i < PROTOGC_MAX_PURGE_CALLBACKS; ++i) {
             if (sPurgeRecords[i].callback && (sPurgeRecords[i].phases & phaseMask)) {
                 callbacks[count++] = sPurgeRecords[i];
             }
         }
-        portEXIT_CRITICAL(&sMux);
+        pgc_exit_critical();
 
         for (size_t i = 0; i < count; ++i) {
             callbacks[i].callback(phaseMask, callbacks[i].context);
@@ -1190,7 +1185,6 @@ inline uint32_t ProtoGC::sLightCollections = 0;
 inline uint32_t ProtoGC::sFullCollections = 0;
 inline uint32_t ProtoGC::sEmergencyCollections = 0;
 inline uint32_t ProtoGC::sHeapGuardPollCounter = 0;
-inline portMUX_TYPE ProtoGC::sMux = portMUX_INITIALIZER_UNLOCKED;
 
 inline ArenaRecord ProtoGC::sArenaRecords[PROTOGC_MAX_ARENAS] = {};
 inline PurgeRecord ProtoGC::sPurgeRecords[PROTOGC_MAX_PURGE_CALLBACKS] = {};

@@ -6,12 +6,12 @@
 // Behavior:
 //   * Disabled by default. Caller (typically main.cpp during ProtoGC::begin)
 //     must call protogc::ProtoGC::enableNewDeleteTakeover(true) to activate.
-//     Until then the override falls back to heap_caps_malloc(MALLOC_CAP_8BIT),
+//     Until then the override falls back to pgc_malloc(MALLOC_CAP_8BIT),
 //     which is identical to the libc default.
 //   * When active: try PSRAM first (managed coalescing heap, then fallback),
 //     then internal SRAM, then bail with std::bad_alloc / nullptr.
 //   * DMA / EXEC capable objects are NOT created via operator new in this
-//     codebase — those allocations stay on direct heap_caps_malloc calls.
+//     codebase — those allocations stay on direct pgc_malloc calls.
 //
 // We define the global operator new in a single TU so the linker pulls this
 // once and the override applies to every .cpp compiled into the firmware.
@@ -21,7 +21,7 @@
 #include <cstdlib>
 #include <new>
 
-#include <esp_heap_caps.h>
+#include "pgc_platform.h"
 
 namespace {
 
@@ -37,9 +37,9 @@ inline void* protogc_global_alloc(std::size_t size) noexcept {
         }
     }
 
-    if (void* p = heap_caps_malloc(size, MALLOC_CAP_8BIT)) return p;
-    if (void* p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)) return p;
-    if (void* p = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)) return p;
+    if (void* p = pgc_malloc(size, MALLOC_CAP_8BIT)) return p;
+    if (void* p = pgc_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)) return p;
+    if (void* p = pgc_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)) return p;
     return nullptr;
 }
 
@@ -52,10 +52,10 @@ inline void protogc_global_free(void* ptr) noexcept {
     }
 
     // ProtoGC::heapFree handles managed-heap and fallback-list pointers.
-    // For pointers minted by raw heap_caps_malloc (boot-time, takeover off),
-    // it returns 0 and we fall back to heap_caps_free.
+    // For pointers minted by raw pgc_malloc (boot-time, takeover off),
+    // it returns 0 and we fall back to pgc_free.
     if (!protogc::ProtoGC::heapFree(ptr)) {
-        heap_caps_free(ptr);
+        pgc_free(ptr);
     }
 }
 

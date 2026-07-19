@@ -10,7 +10,8 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <esp_heap_caps.h>
+
+#include "pgc_platform.h"
 
 namespace protogc {
 
@@ -72,7 +73,7 @@ public:
     PoolAllocator() : mBuffer(nullptr), mFreeList(nullptr), mAllocCount(0), mPeakCount(0), mAllocated{0} {}
 
     ~PoolAllocator() {
-        if (mBuffer) heap_caps_free(mBuffer);
+        if (mBuffer) pgc_free(mBuffer);
     }
 
     // Allocate the backing buffer from PSRAM and build the free list.
@@ -82,7 +83,7 @@ public:
 
         const size_t totalBytes = BlockSize * BlockCount;
         mBuffer = static_cast<uint8_t*>(
-            heap_caps_malloc(totalBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+            pgc_malloc(totalBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
         if (!mBuffer) return false;
 
         clearBitmap();
@@ -142,7 +143,7 @@ public:
 
     /// Two-phase trim helper (M-01): if the pool is completely unused, detach
     /// the backing buffer WITHOUT freeing it and return it to the caller, who
-    /// then heap_caps_free()s it OUTSIDE the ProtoGC critical section.
+    /// then pgc_free()s it OUTSIDE the ProtoGC critical section.
     /// Returns nullptr when the pool is in use or not initialized.
     /// The pool stays valid (a later begin() re-creates the backing buffer).
     uint8_t* detachIfEmpty(size_t* outBytes = nullptr) {
@@ -169,7 +170,7 @@ public:
 
     // Release the backing buffer. All outstanding pointers become invalid.
     void end() {
-        if (mBuffer) { heap_caps_free(mBuffer); mBuffer = nullptr; }
+        if (mBuffer) { pgc_free(mBuffer); mBuffer = nullptr; }
         mFreeList   = nullptr;
         mAllocCount = 0;
         mPeakCount  = 0;

@@ -1,10 +1,10 @@
 #pragma once
 // ProtoGC HeapAllocator - segmented coalescing heap for capability-tagged app data.
 //
-// This allocator owns one or more ESP-IDF heap_caps_malloc() segments. Each
+// This allocator owns one or more pgc_malloc() segments. Each
 // segment is internally split into blocks, freed blocks are coalesced, and
 // trimUnlink()/releaseSegments() return fully-free segments to the system heap
-// (two-phase, so heap_caps_free runs outside the caller's critical section).
+// (two-phase, so pgc_free runs outside the caller's critical section).
 // It does not move live allocations, so all returned pointers remain stable
 // until freed.
 
@@ -12,7 +12,7 @@
 #include <cstdint>
 #include <cstring>
 
-#include <esp_heap_caps.h>
+#include "pgc_platform.h"
 
 namespace protogc {
 
@@ -66,7 +66,7 @@ public:
     // own critical section around all calls). To grow the heap, the caller
     // creates a segment WITHOUT the lock (createSegment), then links and
     // retries WITH the lock (linkSegment + allocate). This keeps slow
-    // heap_caps_malloc calls out of ProtoGC's critical section (M-01).
+    // pgc_malloc calls out of ProtoGC's critical section (M-01).
     void* allocate(size_t sizeBytes, uint32_t caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) {
         if (!isEligibleCaps(caps)) return nullptr;
         if (sizeBytes == 0) sizeBytes = 1;
@@ -157,11 +157,11 @@ public:
     }
 
     // ─── Two-Phase Growth & Trim API ────────────────────────────────────────
-    // Internal — used by ProtoGC to keep heap_caps_malloc/free calls OUT of
+    // Internal — used by ProtoGC to keep pgc_malloc/pgc_free calls OUT of
     // its critical section (M-01). Contract:
     //   allocate/deallocate/reallocate/owns/usableSize/stats: call WITH the
     //       ProtoGC lock held.
-    //   createSegment(): call WITHOUT the lock (may block in heap_caps_malloc).
+    //   createSegment(): call WITHOUT the lock (may block in pgc_malloc).
     //   linkSegment(): call WITH the lock.
     //   trimUnlink(): call WITH the lock; then releaseSegments() WITHOUT the
     //       lock; finally addTrimReleased() WITH the lock.
@@ -191,11 +191,11 @@ public:
                                           ? requestedPayloadBytes
                                           : mDefaultSegmentBytes);
         size_t totalBytes = segmentHeaderBytes() + blockHeaderBytes() + payloadBytes;
-        void* raw = heap_caps_malloc(totalBytes, caps);
+        void* raw = pgc_malloc(totalBytes, caps);
         if (!raw && payloadBytes > requestedPayloadBytes) {
             payloadBytes = alignUp(requestedPayloadBytes);
             totalBytes = segmentHeaderBytes() + blockHeaderBytes() + payloadBytes;
-            raw = heap_caps_malloc(totalBytes, caps);
+            raw = pgc_malloc(totalBytes, caps);
         }
         if (!raw) return nullptr;
 
@@ -259,7 +259,7 @@ public:
         for (size_t i = 0; i < count; ++i) {
             if (!segments[i]) continue;
             released += segments[i]->totalBytes;
-            heap_caps_free(segments[i]);
+            pgc_free(segments[i]);
             segments[i] = nullptr;
         }
         return released;

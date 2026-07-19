@@ -16,7 +16,14 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-IDF="${IDF_PATH:-/c/esp/v6.0.2/esp-idf}"
+IDF=""
+for candidate in "${IDF_PATH:-}" /c/esp/v6.0.2/esp-idf "$HOME/esp/esp-idf" "$HOME/.espressif/master/esp-idf"; do
+    if [ -n "$candidate" ] && [ -d "$candidate/components" ]; then
+        IDF="$candidate"
+        break
+    fi
+done
+IDF="${IDF:-${IDF_PATH:-/c/esp/v6.0.2/esp-idf}}"   # for the error message below
 
 CXXFLAGS="-std=gnu++17 -fsyntax-only -Wall -Wextra -DESP32=1"
 
@@ -42,8 +49,23 @@ find_cxx() {
     return 1
 }
 
-XT_BIN=/c/Espressif/tools/xtensa-esp-elf/esp-15.2.0_20251204/xtensa-esp-elf/bin
-RV_BIN=/c/Espressif/tools/riscv32-esp-elf/esp-15.2.0_20251204/riscv32-esp-elf/bin
+XT_BIN="${XT_BIN:-}"
+RV_BIN="${RV_BIN:-}"
+if [ -z "$XT_BIN" ]; then
+    if [ -d /c/Espressif/tools ]; then
+        XT_BIN=/c/Espressif/tools/xtensa-esp-elf/esp-15.2.0_20251204/xtensa-esp-elf/bin
+    else
+        # Linux/WSL: newest installed xtensa toolchain under ~/.espressif
+        XT_BIN=$(ls -d "$HOME"/.espressif/tools/xtensa-esp-elf/*/xtensa-esp-elf/bin 2>/dev/null | sort -V | tail -n 1)
+    fi
+fi
+if [ -z "$RV_BIN" ]; then
+    if [ -d /c/Espressif/tools ]; then
+        RV_BIN=/c/Espressif/tools/riscv32-esp-elf/esp-15.2.0_20251204/riscv32-esp-elf/bin
+    else
+        RV_BIN=$(ls -d "$HOME"/.espressif/tools/riscv32-esp-elf/*/riscv32-esp-elf/bin 2>/dev/null | sort -V | tail -n 1)
+    fi
+fi
 
 XT_CXX=$(find_cxx "$XT_BIN/xtensa-esp32s3-elf-g++.exe" "$XT_BIN" "xtensa-esp32s3-elf-g++*")
 RV_CXX=$(find_cxx "$RV_BIN/riscv32-esp-elf-g++.exe" "$RV_BIN" "riscv32-esp-elf-g++*")
@@ -95,7 +117,7 @@ build_flags() {
 
 # -------------------------------------------------------------------- checks
 
-TUS="check.cpp check_newdelete.cpp"
+TUS="check.cpp check_newdelete.cpp check_platform.cpp"
 FAILURES=0
 
 run_compiler() {
