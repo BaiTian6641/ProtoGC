@@ -338,6 +338,116 @@ void testHeapAllocator() {
     CHECK_EQ_U(heap.stats().trimReleasedBytes, released);
 }
 
+// ─── 4b. HeapAllocator total-segment-bytes cap ───────────────────────────────
+
+void testHeapSegmentCap() {
+    // Uncapped (default) heap: growth past the cap value used below works —
+    // four 4 KB segments (~16 KB with headers) would exceed a 12 KB cap.
+    HeapAllocator uncapped;
+    uncapped.begin(4096, kPsramCaps, HeapAllocator::defaultPsramForbiddenCaps());
+    CHECK_EQ_U(uncapped.maxSegmentBytes(), 0);
+    bool uOk = true;
+    for (int i = 0; i < 4; ++i) {
+        HeapAllocator::SegmentHeader* seg = uncapped.createSegment(64, kPsramCaps);
+        if (!seg) { uOk = false; break; }
+        uncapped.linkSegment(seg);
+    }
+    CHECK(uOk);
+    CHECK_EQ_U(uncapped.stats().segmentCount, 4);
+    CHECK(uncapped.stats().segmentBytes > 12 * 1024);
+    HeapAllocator::SegmentHeader* uOut[4] = {};
+    const size_t uN = uncapped.trimUnlink(0, uOut, 4);
+    CHECK_EQ_U(uN, 4);
+    HeapAllocator::releaseSegments(uOut, uN);
+    CHECK_EQ_U(uncapped.stats().segmentCount, 0);
+
+    // Capped heap: 12 KB budget, 4 KB default segments. Each segment costs
+    // 4096 payload + header bytes, so exactly two fit; the third is denied.
+    HeapAllocator capped;
+    capped.begin(4096, kPsramCaps, HeapAllocator::defaultPsramForbiddenCaps(), 12 * 1024);
+    CHECK_EQ_U(capped.maxSegmentBytes(), 12 * 1024);
+
+    HeapAllocator::SegmentHeader* segA = capped.createSegment(64, kPsramCaps);
+    CHECK(segA != nullptr);
+    capped.linkSegment(segA);
+    HeapAllocator::SegmentHeader* segB = capped.createSegment(64, kPsramCaps);
+    CHECK(segB != nullptr);
+    capped.linkSegment(segB);
+
+    // Growth past the cap fails cleanly (nullptr) and changes no state.
+    CHECK(capped.createSegment(64, kPsramCaps) == nullptr);
+    CHECK(capped.createSegment(64, kPsramCaps) == nullptr);
+    CHECK_EQ_U(capped.stats().segmentCount, 2);
+    CHECK(capped.stats().segmentBytes >= 2 * 4096);
+    CHECK(capped.stats().segmentBytes <= 12 * 1024);
+
+    // Alloc/free within the budget is unaffected by the cap.
+    void* a1 = capped.allocate(2048, kPsramCaps);
+    void* a2 = capped.allocate(2048, kPsramCaps);
+    CHECK(a1 != nullptr && a2 != nullptr);
+    CHECK(capped.deallocate(a1));
+    void* a3 = capped.allocate(2048, kPsramCaps);
+    CHECK(a3 != nullptr);
+    CHECK(capped.deallocate(a2)); // a3 stays live below
+
+    // Freeing a whole segment re-opens budget: trim releases segA (segB still
+    // holds a3), then growth succeeds again within the cap.
+    HeapAllocator::SegmentHeader* out[4] = {};
+    const size_t nTrim = capped.trimUnlink(0, out, 4);
+    CHECK_EQ_U(nTrim, 1);
+    HeapAllocator::releaseSegments(out, nTrim);
+    HeapAllocator::SegmentHeader* segC = capped.createSegment(64, kPsramCaps);
+    CHECK(segC != nullptr);
+    capped.linkSegment(segC);
+    CHECK(capped.stats().segmentBytes <= 12 * 1024);
+
+    // Two-phase realloc under the cap: growth that fits the existing segments
+    // succeeds without new segments, preserving content.
+    void* r0 = capped.allocate(128, kPsramCaps);
+    CHECK(r0 != nullptr);
+    std::memset(r0, 0x5A, 128);
+    void* r1 = nullptr;
+    CHECK(capped.reallocate(r0, 1024, kPsramCaps, &r1) == HeapAllocator::ReallocStatus::Done);
+    CHECK(r1 != nullptr);
+    CHECK(allBytes(r1, 0x5A, 128));
+
+    // Growth needing a new segment reports NeedsGrowth, and the cap denies
+    // the segment itself — the original allocation stays valid and intact.
+    void* r2 = nullptr;
+    CHECK(capped.reallocate(r1, 8192, kPsramCaps, &r2) == HeapAllocator::ReallocStatus::NeedsGrowth);
+    CHECK(r2 == nullptr);
+    CHECK(capped.createSegment(8192, kPsramCaps) == nullptr);
+    CHECK(capped.owns(r1));
+    CHECK(allBytes(r1, 0x5A, 128));
+
+    // Clean up: free everything and trim all segments back to the region.
+    CHECK(capped.deallocate(r1));
+    CHECK(capped.deallocate(a3));
+    const size_t nAll = capped.trimUnlink(0, out, 4);
+    CHECK_EQ_U(nAll, 2);
+    HeapAllocator::releaseSegments(out, nAll);
+    CHECK_EQ_U(capped.stats().segmentCount, 0);
+
+    // Cap smaller than one segment: the FIRST segment is still allowed (the
+    // heap degrades to clean allocation failure, not a dead allocator).
+    HeapAllocator tiny;
+    tiny.begin(4096, kPsramCaps, HeapAllocator::defaultPsramForbiddenCaps(), 1024);
+    CHECK_EQ_U(tiny.maxSegmentBytes(), 1024);
+    HeapAllocator::SegmentHeader* t1 = tiny.createSegment(64, kPsramCaps);
+    CHECK(t1 != nullptr);
+    tiny.linkSegment(t1);
+    CHECK(tiny.stats().segmentBytes > 1024); // over cap by design
+    void* tp = tiny.allocate(256, kPsramCaps);
+    CHECK(tp != nullptr);
+    CHECK(tiny.createSegment(64, kPsramCaps) == nullptr); // growth denied
+    CHECK(tiny.deallocate(tp));
+    HeapAllocator::SegmentHeader* tOut[1] = {};
+    const size_t tN = tiny.trimUnlink(0, tOut, 1);
+    CHECK_EQ_U(tN, 1);
+    HeapAllocator::releaseSegments(tOut, tN);
+    CHECK_EQ_U(tiny.stats().segmentCount, 0);
+}
+
 // ─── 5. ProtoGC facade: begin + heap alloc/calloc/realloc ────────────────────
 
 void testFacadeHeap() {
@@ -743,6 +853,7 @@ int main() {
     runGroup("ArenaAllocator", testArenaAllocator);
     runGroup("PoolAllocator", testPoolAllocator);
     runGroup("HeapAllocator", testHeapAllocator);
+    runGroup("HeapAllocator cap", testHeapSegmentCap);
     runGroup("facade heap ops", testFacadeHeap);
     runGroup("facade pools", testFacadePools);
     runGroup("facade arenas", testFacadeArenas);

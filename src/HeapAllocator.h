@@ -53,12 +53,21 @@ public:
               defaultPsramForbiddenCaps());
     }
 
-    void begin(size_t defaultSegmentBytes, uint32_t requiredCaps, uint32_t forbiddenCaps) {
+    // maxSegmentBytes: optional hard cap on TOTAL segment bytes (segment and
+    // block headers included, accounted exactly like mSegmentBytes). 0 means
+    // unlimited (the default — pre-cap behavior). Once the cap is set, any
+    // growth that would push mSegmentBytes past it fails cleanly:
+    // createSegment() returns nullptr. RP2350 scene-budget use case: a
+    // resource heap that cannot outgrow the byte budget the static bump
+    // pools it replaces used to guarantee.
+    void begin(size_t defaultSegmentBytes, uint32_t requiredCaps, uint32_t forbiddenCaps,
+               size_t maxSegmentBytes = 0) {
         mDefaultSegmentBytes = alignUp(defaultSegmentBytes > minimumSegmentBytes()
                                            ? defaultSegmentBytes
                                            : minimumSegmentBytes());
         mRequiredCaps = requiredCaps;
         mForbiddenCaps = forbiddenCaps;
+        mMaxSegmentBytes = maxSegmentBytes;
     }
 
     // Non-growing allocation: searches existing segments only.
@@ -191,6 +200,10 @@ public:
                                           ? requestedPayloadBytes
                                           : mDefaultSegmentBytes);
         size_t totalBytes = segmentHeaderBytes() + blockHeaderBytes() + payloadBytes;
+        // Segment-byte cap: growth that would exceed mMaxSegmentBytes fails
+        // here, before pgc_malloc (the smaller fallback size below passes the
+        // same check whenever this one does, so it needs no re-check).
+        if (!growthWithinCap(totalBytes)) return nullptr;
         void* raw = pgc_malloc(totalBytes, caps);
         if (!raw && payloadBytes > requestedPayloadBytes) {
             payloadBytes = alignUp(requestedPayloadBytes);
@@ -281,6 +294,9 @@ public:
         return result;
     }
 
+    // Configured cap on total segment bytes; 0 = unlimited (the default).
+    size_t maxSegmentBytes() const { return mMaxSegmentBytes; }
+
         uint32_t requiredCaps() const { return mRequiredCaps; }
 
         static constexpr uint32_t defaultPsramForbiddenCaps() {
@@ -326,6 +342,7 @@ private:
     size_t mAllocationCount = 0;
     size_t mPeakUsedBytes = 0;
     size_t mTrimReleasedBytes = 0;
+    size_t mMaxSegmentBytes = 0;  // 0 = unlimited
     uint32_t mRequiredCaps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
     uint32_t mForbiddenCaps = defaultPsramForbiddenCaps();
 
@@ -337,6 +354,19 @@ private:
     static size_t blockHeaderBytes() { return alignUp(sizeof(BlockHeader)); }
     static size_t minimumSegmentBytes() {
         return segmentHeaderBytes() + blockHeaderBytes() + PROTOGC_HEAP_MIN_SPLIT_BYTES;
+    }
+
+    // Cap check for segment growth: true when linking another segment of
+    // newSegmentTotalBytes (the same total linkSegment() adds to
+    // mSegmentBytes) stays within mMaxSegmentBytes. 0 = unlimited. The first
+    // segment is always allowed, so a cap smaller than one segment just means
+    // clean allocation failure instead of a dead allocator. Subtraction form
+    // keeps the comparison overflow-safe (mSegmentBytes may already exceed
+    // the cap via that first segment).
+    bool growthWithinCap(size_t newSegmentTotalBytes) const {
+        if (mMaxSegmentBytes == 0 || mSegmentCount == 0) return true;
+        if (mSegmentBytes >= mMaxSegmentBytes) return false;
+        return newSegmentTotalBytes <= mMaxSegmentBytes - mSegmentBytes;
     }
 
         bool isEligibleCaps(uint32_t caps) const {
