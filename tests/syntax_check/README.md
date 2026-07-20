@@ -8,6 +8,12 @@ both ESP cross compilers installed on this machine — no linking, no hardware:
 | `xtensa-esp32s3`  | `xtensa-esp32s3-elf-g++`    | ESP32-S3 (Xtensa)    |
 | `riscv32-esp32p4` | `riscv32-esp-elf-g++`       | ESP32-P4 (RISC-V)    |
 
+A third script, `run_check_pico.sh`, checks the Pico SDK backend
+(`src/pgc_pico.cpp` via `check_pico.cpp`) against the **real Pico SDK
+headers** with `arm-none-eabi-g++` and the same flags the RP2350-ProtoGPU
+firmware build uses — see the comment header of that script for details and
+prerequisite overrides (`PICO_SDK_PATH`, `TOOLCHAIN_BIN`).
+
 ## Run
 
 ```sh
@@ -40,6 +46,11 @@ translation units:
 - `check_newdelete.cpp` — includes `../../src/ProtoGCNewDelete.cpp` as its own
   TU, validating the global `operator new`/`operator delete` override
   definitions exactly as a firmware build compiles them.
+- `check_platform.cpp` — includes `../../src/pgc_espidf.cpp` as its own TU,
+  validating the ESP-IDF backend implementation against the real IDF headers.
+- `check_pico.cpp` (run by `run_check_pico.sh`, not by `run_check.sh`) —
+  includes `../../src/pgc_pico.cpp` as its own TU, validating the Pico SDK
+  backend against the real Pico SDK headers.
 
 ## Files
 
@@ -107,19 +118,14 @@ Notes on the non-obvious ones:
   (`components/xtensa/<target>/include`, `components/xtensa/include`), not
   from the toolchain sysroot.
 
-## Known warnings
+## Known warnings — RESOLVED
 
-`src/ProtoGC.h` (`HeapStats::print()`): the format string is split by a stray
-comma at the end of the first string literal, so `printf` sees the second
-literal as the first *argument*. GCC reports:
-
-```
-warning: format '%u' expects argument of type 'unsigned int', but argument 3 has type 'const char*' [-Wformat=]
-warning: too many arguments for format [-Wformat-extra-args]
-```
-
-This is a real bug in the library (the printed stats are garbled), not a
-harness artifact. Warnings do not affect the PASS/FAIL result.
+`src/ProtoGC.h` (`HeapStats::print()`) once had the format string split by a
+stray comma at the end of the first string literal, so `printf` saw the second
+literal as the first *argument* (garbled stats, `-Wformat`/`-Wformat-extra-args`
+warnings). **Fixed by `e5e1cd1` ("repair stats format string")** — the current
+string is proper adjacent-literal continuation and all harnesses compile
+warning-free. Kept here as history.
 
 ## Limitations
 

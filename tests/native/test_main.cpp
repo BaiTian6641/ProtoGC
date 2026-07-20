@@ -575,8 +575,9 @@ void testHeapGuard() {
 }
 
 // ─── 11. Collection phases, purge callbacks, arena policies ──────────────────
-// Runs LAST: emergency() trims the pool backing buffers, after which poolAlloc
-// falls back to the heap until a re-begin — no group after this one needs pools.
+// emergency() trims the (empty) pool backing buffers; before the lazy re-begin
+// existed, poolAlloc would fall back to the heap permanently from here on.
+// Group 12 verifies the re-begin behavior and must run after this one.
 
 int sCbCountA = 0;
 int sCbCountB = 0;
@@ -645,6 +646,83 @@ void testCollectionPhases() {
     ProtoGC::destroyArena(aMan);
 }
 
+// ─── 12. Pool lazy re-begin after emergency detach ───────────────────────────
+// Runs after "collection phases", whose emergency() detached every (empty)
+// pool's backing buffer. Verifies the lazy re-begin contract:
+//   * poolAlloc on a detached size class re-creates the backing buffer on
+//     demand and serves from the pool again (not the heap fallback);
+//   * the detach invariant holds — a NON-empty pool is never detached, and
+//     live pool data survives a trim of the empty classes around it;
+//   * a class whose re-begin allocation fails still falls back cleanly;
+//   * an already-ready pool never re-begins (reserved bytes stay constant).
+
+void testPoolLazyRebegin() {
+    const HeapStats s0 = ProtoGC::stats();
+    CHECK_EQ_U(s0.poolReservedBytes, 0); // emergency() detached all empty pools
+
+    // 1. The detached 32-byte class re-begins lazily on first use.
+    void* p = ProtoGC::poolAlloc(24);
+    CHECK(p != nullptr);
+    CHECK(ProtoGC::poolOwns(p));
+    const HeapStats s1 = ProtoGC::stats();
+    CHECK_EQ_U(s1.poolUsedBlocks, s0.poolUsedBlocks + 1);
+    CHECK_EQ_U(s1.poolUsedBytes, s0.poolUsedBytes + 32);
+    CHECK_EQ_U(s1.poolReservedBytes, 32 * PROTOGC_POOL_32); // only this class
+    CHECK_EQ_U(s1.psramManagedUsedBytes, s0.psramManagedUsedBytes); // no heap
+    CHECK_EQ_U(s1.fallbackBytes, s0.fallbackBytes);
+    fillRamp(p, 24);
+    CHECK(rampMatches(p, 24));
+
+    // 2. The now-ready pool serves further allocs without another re-begin,
+    //    and the re-begun backing buffer persists across frees.
+    void* p2 = ProtoGC::poolAlloc(20);
+    CHECK(p2 != nullptr);
+    CHECK(ProtoGC::poolOwns(p2));
+    const HeapStats s2 = ProtoGC::stats();
+    CHECK_EQ_U(s2.poolReservedBytes, s1.poolReservedBytes);
+    CHECK_EQ_U(s2.poolUsedBlocks, s1.poolUsedBlocks + 1);
+    ProtoGC::poolFree(p);
+    ProtoGC::poolFree(p2);
+    CHECK_EQ_U(ProtoGC::stats().poolUsedBlocks, s0.poolUsedBlocks);
+    CHECK_EQ_U(ProtoGC::stats().poolReservedBytes, 32 * PROTOGC_POOL_32);
+
+    // 3. Invariant: a NON-empty pool is never detached — live data survives a
+    //    trim that detaches the empty classes around it.
+    void* q = ProtoGC::poolAlloc(100); // re-begins the 128-byte class
+    CHECK(q != nullptr);
+    CHECK(ProtoGC::poolOwns(q));
+    std::memset(q, 0x5A, 100);
+    CHECK_EQ_U(ProtoGC::stats().poolReservedBytes,
+               32 * PROTOGC_POOL_32 + 128 * PROTOGC_POOL_128);
+    ProtoGC::mallocTrim(0, true); // detaches EMPTY pools only
+    CHECK(allBytes(q, 0x5A, 100)); // live allocation untouched
+    CHECK(ProtoGC::poolOwns(q));
+    const HeapStats s3 = ProtoGC::stats();
+    CHECK_EQ_U(s3.poolReservedBytes, 128 * PROTOGC_POOL_128); // non-empty kept
+    ProtoGC::poolFree(q);
+
+    // 4. Re-begin failure (psram region cannot fit the 8 KB backing) still
+    //    falls back cleanly to the heap path.
+    const size_t psramFreeBefore = pgc_free_size(MALLOC_CAP_SPIRAM);
+    void* filler = pgc_malloc(psramFreeBefore - 4096, MALLOC_CAP_SPIRAM);
+    CHECK(filler != nullptr);
+    void* r = ProtoGC::poolAlloc(1000); // 1K class needs an 8 KB backing buffer
+    CHECK(r != nullptr);
+    CHECK(!ProtoGC::poolOwns(r)); // heap fallback; the pool stays detached
+    const HeapStats s4 = ProtoGC::stats();
+    CHECK_EQ_U(s4.poolReservedBytes, s3.poolReservedBytes);
+    CHECK(s4.psramManagedUsedBytes >= 1000);
+    std::memset(r, 0xA5, 1000);
+    CHECK(allBytes(r, 0xA5, 1000));
+    ProtoGC::poolFree(r); // routes to heapFree internally
+    pgc_free(filler);
+
+    // 5. Returning the fallback segment leaves the region exactly as before —
+    //    no leak from the whole re-begin + fallback + trim round trip.
+    ProtoGC::mallocTrim(); // segments only; pool buffers stay
+    CHECK_EQ_U(pgc_free_size(MALLOC_CAP_SPIRAM), psramFreeBefore);
+}
+
 void runGroup(const char* name, void (*fn)()) {
     const int checksBefore = gChecks;
     const int failuresBefore = gFailures;
@@ -672,6 +750,7 @@ int main() {
     runGroup("HeapStats consistency", testStatsConsistency);
     runGroup("HeapGuard", testHeapGuard);
     runGroup("collection phases", testCollectionPhases);
+    runGroup("pool lazy re-begin", testPoolLazyRebegin);
 
     std::printf("\n");
     if (gFailures == 0) {

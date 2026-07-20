@@ -80,12 +80,32 @@ public:
     // Returns false if PSRAM allocation fails (pool will be disabled).
     bool begin() {
         if (mBuffer) return true; // already initialized
+        return attachBacking(allocateBacking());
+    }
 
-        const size_t totalBytes = BlockSize * BlockCount;
-        mBuffer = static_cast<uint8_t*>(
-            pgc_malloc(totalBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        if (!mBuffer) return false;
+    // ─── Two-phase (re-)begin (M-01) ─────────────────────────────────────────
+    // Split of begin() so the backing-buffer pgc_malloc can run OUTSIDE the
+    // ProtoGC critical section while the publish step runs UNDER it (mirrors
+    // detachIfEmpty(), and HeapAllocator's createSegment()/linkSegment() pair):
+    //   allocateBacking(): call WITHOUT the lock (pgc_malloc may block).
+    //   attachBacking():   call WITH the lock.
+    // attachBacking() returns false for a null buffer or when the pool is
+    // already backed (a concurrent re-begin won) — the caller must then
+    // pgc_free() its buffer, again OUTSIDE the lock.
+    //
+    // SAFETY INVARIANT: a pool only ever becomes unbacked while EMPTY —
+    // detachIfEmpty()/trimIfEmpty() require mAllocCount == 0 and end() is an
+    // explicit teardown — so no live pointers into the old buffer can exist.
+    // A re-begun pool therefore cannot confuse stale pointers, even if the
+    // new backing buffer lands at the old buffer's address.
+    uint8_t* allocateBacking() const {
+        return static_cast<uint8_t*>(pgc_malloc(
+            BlockSize * BlockCount, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    }
 
+    bool attachBacking(uint8_t* buffer) {
+        if (!buffer || mBuffer) return false;
+        mBuffer = buffer;
         clearBitmap();
         buildFreeList();
         return true;
@@ -145,7 +165,10 @@ public:
     /// the backing buffer WITHOUT freeing it and return it to the caller, who
     /// then pgc_free()s it OUTSIDE the ProtoGC critical section.
     /// Returns nullptr when the pool is in use or not initialized.
-    /// The pool stays valid (a later begin() re-creates the backing buffer).
+    /// The pool stays valid: a later begin() re-creates the backing buffer,
+    /// and ProtoGC::poolAlloc re-creates it lazily on demand via
+    /// allocateBacking()/attachBacking() (see there for the EMPTY-pool
+    /// safety invariant this detach preserves).
     uint8_t* detachIfEmpty(size_t* outBytes = nullptr) {
         if (mAllocCount != 0 || !mBuffer) return nullptr;
         if (outBytes) *outBytes = BlockSize * BlockCount;

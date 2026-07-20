@@ -522,6 +522,29 @@ public:
         ptr = poolAllocInternalLocked(sizeBytes);
         pgc_exit_critical();
         if (ptr) return ptr;
+
+        // Lazy re-begin: a pool detached by an emergency trim is re-created on
+        // first use instead of permanently degrading this size class to the
+        // heap. M-01 two-phase (same shape as heapAlloc's segment growth):
+        // pick a detached candidate under the lock, pgc_malloc its backing
+        // buffer WITHOUT the lock (rebeginPoolAndAlloc), then attach + retry
+        // UNDER the lock. SAFETY INVARIANT (see PoolAllocator::attachBacking):
+        // detach only ever happens on an EMPTY pool, so no stale pointers
+        // into the old buffer can exist. Any failure keeps the pre-existing
+        // heapAlloc fallback below unchanged.
+        pgc_enter_critical();
+        const PoolClass rebegin = firstDetachedPoolLocked(sizeBytes);
+        pgc_exit_critical();
+        switch (rebegin) {
+        case PoolClass::Pool32:  ptr = rebeginPoolAndAlloc(sPool32,  sizeBytes); break;
+        case PoolClass::Pool64:  ptr = rebeginPoolAndAlloc(sPool64,  sizeBytes); break;
+        case PoolClass::Pool128: ptr = rebeginPoolAndAlloc(sPool128, sizeBytes); break;
+        case PoolClass::Pool256: ptr = rebeginPoolAndAlloc(sPool256, sizeBytes); break;
+        case PoolClass::Pool512: ptr = rebeginPoolAndAlloc(sPool512, sizeBytes); break;
+        case PoolClass::Pool1K:  ptr = rebeginPoolAndAlloc(sPool1K,  sizeBytes); break;
+        case PoolClass::None: break;
+        }
+        if (ptr) return ptr;
         return heapAlloc(sizeBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
 
@@ -895,6 +918,47 @@ private:
         if (sizeBytes <= 512) { void* p = sPool512.alloc(); if (p) return p; }
         if (sizeBytes <= 1024) { void* p = sPool1K.alloc(); if (p) return p; }
         return nullptr;
+    }
+
+    enum class PoolClass : uint8_t { None, Pool32, Pool64, Pool128, Pool256, Pool512, Pool1K };
+
+    // First detached (unbacked) pool in the size-class chain for sizeBytes,
+    // smallest fitting class first — the cheapest class whose re-begin can
+    // serve the request. Ready-but-full classes are skipped: the caller's
+    // first pass already proved they cannot serve this allocation. Call WITH
+    // the lock held.
+    static PoolClass firstDetachedPoolLocked(size_t sizeBytes) {
+        if (sizeBytes <= 32   && !sPool32.isReady())  return PoolClass::Pool32;
+        if (sizeBytes <= 64   && !sPool64.isReady())  return PoolClass::Pool64;
+        if (sizeBytes <= 128  && !sPool128.isReady()) return PoolClass::Pool128;
+        if (sizeBytes <= 256  && !sPool256.isReady()) return PoolClass::Pool256;
+        if (sizeBytes <= 512  && !sPool512.isReady()) return PoolClass::Pool512;
+        if (sizeBytes <= 1024 && !sPool1K.isReady())  return PoolClass::Pool1K;
+        return PoolClass::None;
+    }
+
+    // M-01 two-phase lazy re-begin of a detached pool: phase 1 pgc_mallocs the
+    // backing buffer WITHOUT the ProtoGC critical section (pgc_malloc takes
+    // its own locks and may block); phase 2 attaches it and retries the
+    // allocation WITH the lock. If a concurrent re-begin won the race the
+    // redundant buffer is freed (again unlocked) and the retry still runs —
+    // the pool is backed now and can serve the request. Returns nullptr when
+    // the backing allocation failed; the caller then takes the heap fallback.
+    //
+    // Re-begin lives here in the facade rather than inside PoolAllocator::
+    // alloc(): alloc() must stay usable under the caller's lock (and lock-free
+    // for direct PoolAllocator users), so it can never pgc_malloc itself.
+    // Direct PoolAllocator users keep the explicit begin()/end() API.
+    template <size_t BlockSize, size_t BlockCount>
+    static void* rebeginPoolAndAlloc(PoolAllocator<BlockSize, BlockCount>& pool, size_t sizeBytes) {
+        uint8_t* backing = pool.allocateBacking();   // phase 1: unlocked
+        if (!backing) return nullptr;
+        pgc_enter_critical();                        // phase 2: locked
+        const bool attached = pool.attachBacking(backing);
+        void* ptr = poolAllocInternalLocked(sizeBytes);
+        pgc_exit_critical();
+        if (!attached) pgc_free(backing);            // lost the race: unlocked free
+        return ptr;
     }
 
     static bool poolFreeInternalLocked(void* ptr) {
