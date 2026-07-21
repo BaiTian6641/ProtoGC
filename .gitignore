@@ -9,3 +9,6 @@
 Thumbs.db
 __pycache__/
 *.pyc
+
+# Test/build outputs (native test binaries, Pico syntax-check shims)
+build/
